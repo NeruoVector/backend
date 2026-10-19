@@ -3,9 +3,9 @@ FROM rust:1-slim-bookworm AS builder
 
 WORKDIR /app
 
-# zstd-sys/lz4-sys 등 C 의존성 빌드에 필요
+# zstd-sys/lz4-sys/aws-lc-sys 등 C 의존성 빌드에 필요
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential pkg-config \
+    && apt-get install -y --no-install-recommends build-essential pkg-config cmake perl \
     && rm -rf /var/lib/apt/lists/*
 
 # 의존성 레이어 캐시: 더미 main.rs 로 먼저 빌드

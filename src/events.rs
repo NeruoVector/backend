@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rskafka::{
     client::{
         ClientBuilder,
@@ -9,6 +10,7 @@ use rskafka::{
     record::Record,
 };
 use serde::Serialize;
+use tokio::sync::OnceCell;
 
 /// Kafka `neurovector.events` 토픽으로 발행하는 이벤트
 #[derive(Debug, Serialize)]
@@ -17,41 +19,67 @@ pub struct DetectionEvent<'a> {
     pub drone_id: &'a str,
     pub label: &'a str,
     pub confidence: f32,
-    pub detected_at: chrono::DateTime<Utc>,
+    pub detected_at: DateTime<Utc>,
 }
 
-/// 이벤트를 Kafka 로 발행한다.
+/// Kafka producer 를 재사용하는 얇은 래퍼.
 ///
-/// 실패해도 호출한 쪽의 주 흐름(DB 저장 등)을 막지 않도록
-/// 반환값을 호출부에서 로그로만 처리한다.
-pub async fn publish_detection(
-    brokers: &str,
-    topic: &str,
-    event: &DetectionEvent<'_>,
-) -> anyhow::Result<()> {
-    let client = ClientBuilder::new(brokers.split(',').map(str::to_string).collect())
-        .build()
-        .await?;
-
-    let partition = client
-        .partition_client(topic, 0, UnknownTopicHandling::Retry)
-        .await?;
-
-    produce(&partition, event).await
+/// 기존 구현은 이벤트마다 Client 와 PartitionClient 를 새로 만들었는데,
+/// MQTT 로 초당 여러 건이 들어오는 환경에서는 커넥션이 폭증한다.
+#[derive(Clone)]
+pub struct KafkaPublisher {
+    brokers: String,
+    topic: String,
+    partition: Arc<OnceCell<Arc<PartitionClient>>>,
 }
 
-async fn produce(partition: &PartitionClient, event: &DetectionEvent<'_>) -> anyhow::Result<()> {
-    let payload = serde_json::to_vec(event)?;
+impl KafkaPublisher {
+    pub fn new(brokers: impl Into<String>, topic: impl Into<String>) -> Self {
+        Self {
+            brokers: brokers.into(),
+            topic: topic.into(),
+            partition: Arc::new(OnceCell::new()),
+        }
+    }
 
-    let record = Record {
-        key: Some(event.drone_id.as_bytes().to_vec()),
-        value: Some(payload),
-        headers: BTreeMap::new(),
-        timestamp: Utc::now(),
-    };
+    async fn partition(&self) -> anyhow::Result<Arc<PartitionClient>> {
+        let client = self
+            .partition
+            .get_or_try_init(|| async {
+                let brokers = self
+                    .brokers
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect::<Vec<_>>();
 
-    partition
-        .produce(vec![record], Compression::NoCompression)
-        .await?;
-    Ok(())
+                let client = ClientBuilder::new(brokers).build().await?;
+                let partition = client
+                    .partition_client(self.topic.clone(), 0, UnknownTopicHandling::Retry)
+                    .await?;
+
+                Ok::<_, anyhow::Error>(Arc::new(partition))
+            })
+            .await?;
+
+        Ok(Arc::clone(client))
+    }
+
+    pub async fn publish_detection(&self, event: &DetectionEvent<'_>) -> anyhow::Result<()> {
+        let partition = self.partition().await?;
+        let payload = serde_json::to_vec(event)?;
+
+        let record = Record {
+            key: Some(event.drone_id.as_bytes().to_vec()),
+            value: Some(payload),
+            headers: BTreeMap::new(),
+            timestamp: Utc::now(),
+        };
+
+        partition
+            .produce(vec![record], Compression::NoCompression)
+            .await?;
+        Ok(())
+    }
 }
