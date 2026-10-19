@@ -6,6 +6,7 @@ pub mod deliveries;
 pub mod detections;
 pub mod flights;
 pub mod inventory;
+pub mod orders;
 pub mod risk;
 pub mod route_plans;
 pub mod streams;
@@ -19,4 +20,5 @@ pub fn router() -> Router<AppState> {
         .nest("/risk", risk::router())
         .nest("/inventory", inventory::router())
         .merge(streams::router())
+        .merge(orders::router())
 }
