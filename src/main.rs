@@ -10,9 +10,16 @@ mod config;
 mod db;
 mod error;
 mod events;
+mod geo;
+mod ingest;
+mod media;
+mod models;
+mod mqtt;
 mod routes;
 mod state;
 
+use events::KafkaPublisher;
+use media::MediaClient;
 use state::AppState;
 
 #[tokio::main]
@@ -34,12 +41,39 @@ async fn main() -> anyhow::Result<()> {
 
     let redis = redis::Client::open(config.redis_url.clone())?;
 
+    if let Err(err) = tokio::fs::create_dir_all(&config.media_recordings_dir).await {
+        tracing::warn!(
+            path = %config.media_recordings_dir.display(),
+            error = %err,
+            "failed to create recordings directory"
+        );
+    }
+
     let state = AppState {
         pool,
         redis,
-        kafka_brokers: config.kafka_brokers.clone(),
-        kafka_topic_events: config.kafka_topic_events.clone(),
+        kafka: KafkaPublisher::new(
+            config.kafka_brokers.clone(),
+            config.kafka_topic_events.clone(),
+        ),
+        media: MediaClient::new(
+            config.media_api_base_url.clone(),
+            config.media_whep_base_url.clone(),
+            config.media_srt_public_host.clone(),
+            config.media_srt_port,
+            config.media_recordings_dir.clone(),
+        ),
+        max_altitude_m: config.max_altitude_m,
+        route_max_leg_m: config.route_max_leg_m,
+        route_max_distance_m: config.route_max_distance_m,
+        route_battery_wh: config.route_battery_wh,
+        route_power_w: config.route_power_w,
+        risk_lookback_days: config.risk_lookback_days,
+        risk_corridor_m: config.risk_corridor_m,
+        telemetry_online_ttl_seconds: config.telemetry_online_ttl_seconds,
     };
+
+    mqtt::spawn(state.clone(), &config);
 
     let app = Router::new()
         .route("/", get(root))
@@ -69,7 +103,7 @@ async fn root() -> Json<RootResponse> {
     Json(RootResponse {
         name: "neurovector-backend",
         version: env!("CARGO_PKG_VERSION"),
-        docs: "/health, /health/ready, /api/v1/detections",
+        docs: "/health, /health/ready, /api/v1/detections, /api/v1/routes, /api/v1/deliveries, /api/v1/flights, /api/v1/risk, /api/v1/orders, /api/v1/streams, /api/v1/recordings",
     })
 }
 
