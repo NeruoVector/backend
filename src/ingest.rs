@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use chrono::Utc;
 use redis::AsyncCommands;
 use serde_json::json;
@@ -65,9 +67,23 @@ pub async fn ingest_detection(
         detected_at: detection.detected_at,
     };
 
-    if let Err(err) = state.kafka.publish_detection(&event).await {
-        // Kafka 장애가 감지 저장 자체를 막지는 않는다.
-        tracing::warn!(error = %err, detection_id = %detection.id, "failed to publish detection event");
+    // Kafka 장애 시 MQTT 수신 루프가 무기한 블록되지 않도록 타임아웃을 둔다.
+    match tokio::time::timeout(
+        Duration::from_secs(2),
+        state.kafka.publish_detection(&event),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => {
+            tracing::warn!(error = %err, detection_id = %detection.id, "failed to publish detection event");
+        }
+        Err(_) => {
+            tracing::warn!(
+                detection_id = %detection.id,
+                "timed out publishing detection event"
+            );
+        }
     }
 
     Ok(detection)
