@@ -6,8 +6,10 @@ use sqlx::postgres::PgPoolOptions;
 use tower_http::{cors::CorsLayer, trace::TraceLayer};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod cache;
 mod config;
 mod db;
+mod docs;
 mod error;
 mod events;
 mod geo;
@@ -15,12 +17,15 @@ mod ingest;
 mod media;
 mod models;
 mod mqtt;
+mod order_queue;
 mod routes;
 mod state;
 
 use events::KafkaPublisher;
 use media::MediaClient;
 use state::AppState;
+use utoipa::{OpenApi, ToSchema};
+use utoipa_swagger_ui::SwaggerUi;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -51,10 +56,15 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState {
         pool,
-        redis,
+        redis: redis.clone(),
+        cache: cache::Cache::new(redis, config.cache_enabled, config.cache_ttl_seconds),
         kafka: KafkaPublisher::new(
             config.kafka_brokers.clone(),
             config.kafka_topic_events.clone(),
+        ),
+        order_queue: KafkaPublisher::new(
+            config.kafka_brokers.clone(),
+            config.kafka_topic_orders.clone(),
         ),
         media: MediaClient::new(
             config.media_api_base_url.clone(),
@@ -74,11 +84,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     mqtt::spawn(state.clone(), &config);
+    order_queue::spawn_worker(state.clone(), &config);
 
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/health/ready", get(health_ready))
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi()))
         .nest("/api/v1", routes::router())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
@@ -92,38 +104,61 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[derive(Serialize)]
-struct RootResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct RootResponse {
     name: &'static str,
     version: &'static str,
     docs: &'static str,
 }
 
-async fn root() -> Json<RootResponse> {
+#[utoipa::path(
+    get,
+    path = "/",
+    responses((status = 200, description = "서비스 정보", body = RootResponse)),
+    tag = "system"
+)]
+pub(crate) async fn root() -> Json<RootResponse> {
     Json(RootResponse {
         name: "neurovector-backend",
         version: env!("CARGO_PKG_VERSION"),
-        docs: "/health, /health/ready, /api/v1/detections, /api/v1/routes, /api/v1/deliveries, /api/v1/flights, /api/v1/risk, /api/v1/orders, /api/v1/streams, /api/v1/recordings",
+        docs: "/swagger-ui, /api-docs/openapi.json, /health, /health/ready, /api/v1/detections, /api/v1/routes, /api/v1/deliveries, /api/v1/flights, /api/v1/risk, /api/v1/orders, /api/v1/admin/orders, /api/v1/inventory, /api/v1/streams, /api/v1/recordings",
     })
 }
 
-#[derive(Serialize)]
-struct HealthResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct HealthResponse {
     status: &'static str,
 }
 
-async fn health() -> Json<HealthResponse> {
+#[utoipa::path(
+    get,
+    path = "/health",
+    responses((status = 200, description = "liveness", body = HealthResponse)),
+    tag = "system"
+)]
+pub(crate) async fn health() -> Json<HealthResponse> {
     Json(HealthResponse { status: "ok" })
 }
 
-#[derive(Serialize)]
-struct ReadinessResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ReadinessResponse {
     status: &'static str,
     postgres: &'static str,
     redis: &'static str,
 }
 
-async fn health_ready(State(state): State<AppState>) -> (StatusCode, Json<ReadinessResponse>) {
+#[utoipa::path(
+    get,
+    path = "/health/ready",
+    responses(
+        (status = 200, description = "readiness", body = ReadinessResponse),
+        (status = 503, description = "Postgres/Redis 중 하나 이상 비정상", body = ReadinessResponse)
+    ),
+    tag = "system"
+)]
+pub(crate) async fn health_ready(
+    State(state): State<AppState>,
+) -> (StatusCode, Json<ReadinessResponse>) {
     let db_ok = db::ping(&state.pool).await.is_ok();
 
     let redis_ok = {

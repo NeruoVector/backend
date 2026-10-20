@@ -2,6 +2,7 @@ use axum::Router;
 
 use crate::state::AppState;
 
+pub mod admin;
 pub mod deliveries;
 pub mod detections;
 pub mod flights;
@@ -19,6 +20,7 @@ pub fn router() -> Router<AppState> {
         .nest("/flights", flights::router())
         .nest("/risk", risk::router())
         .nest("/inventory", inventory::router())
+        .nest("/admin", admin::router())
         .merge(streams::router())
         .merge(orders::router())
 }

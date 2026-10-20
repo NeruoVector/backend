@@ -8,6 +8,9 @@ NeuroVector API 서버입니다.
 - MediaMTX 연동 (SRT 영상 수신, WebRTC/WHEP 중계, 녹화 조회)
 - 경로 검증 · 배송 일정 · 장기 위험 예측 · 비행 분석
 - 재고 · 주문 · 더미 결제
+- Kafka 기반 비동기 주문 큐 · 주문/결제 이벤트 관리
+- Redis cache-aside (주문/재고/관리자 조회)
+- Swagger UI (`/swagger-ui`, `/api-docs/openapi.json`)
 
 ## 요구 사항
 
@@ -27,6 +30,11 @@ cargo run
 curl http://localhost:8081/health
 curl http://localhost:8081/health/ready
 ```
+
+API 문서는 Swagger UI 에서 확인할 수 있습니다.
+
+- Swagger UI: `http://localhost:8081/swagger-ui`
+- OpenAPI JSON: `http://localhost:8081/api-docs/openapi.json`
 
 ## API 요약
 
@@ -93,7 +101,9 @@ srt://<MEDIA_SRT_PUBLIC_HOST>:8890?streamid=publish:drone-001
 | `GET/POST` | `/api/v1/inventory` | 재고 목록/등록 |
 | `GET/PATCH` | `/api/v1/inventory/{id}` | 재고 조회/수정 |
 | `POST` | `/api/v1/inventory/{id}/restock` | 재고 추가 |
-| `GET/POST` | `/api/v1/orders` | 주문 목록/생성 |
+| `GET/POST` | `/api/v1/orders` | 주문 목록/동기 생성 |
+| `POST` | `/api/v1/orders/queue` | Kafka 기반 비동기 주문 생성 (202) |
+| `GET` | `/api/v1/orders/jobs/{id}` | 비동기 주문 작업 상태 |
 | `GET` | `/api/v1/orders/{id}` | 주문 상세 (품목/결제 포함) |
 | `PATCH` | `/api/v1/orders/{id}/status` | 주문 상태 전환 |
 | `GET/POST` | `/api/v1/orders/{id}/payments` | 결제 내역/더미 결제 |
@@ -114,6 +124,51 @@ curl -X POST http://localhost:8081/api/v1/orders/{id}/payments \
   -H 'Content-Type: application/json' \
   -d '{"method":"dummy_card","simulate":"failure"}'
 ```
+
+### Kafka 주문 큐 / 관리자 API
+
+`POST /api/v1/orders/queue` 는 주문 요청을 `order_jobs` 테이블에 저장한 뒤
+`KAFKA_TOPIC_ORDERS` (`neurovector.orders`) 로 `job_id` 를 발행합니다. 백그라운드
+`order-worker` 가 메시지를 소비해 동기 API 와 동일한 트랜잭션으로 주문/재고를 처리합니다.
+
+- 작업 상태: `queued → processing → completed` 또는 `failed`/`dead`/`cancelled`
+- 컨슈머 오프셋은 `kafka_consumer_offsets` 에 저장되어 재시작 후 이어서 처리합니다.
+- worker 는 job 상태를 원자적으로 선점(claim)하므로 메시지가 재처리되어도 주문이 중복 생성되지 않습니다.
+- 이벤트는 `event_id` 를 기본키로 사용해 재처리 시 중복 적재를 무시합니다.
+- Kafka 발행에 실패하면 job 은 `queued` 로 남고 응답의 `kafka_published=false` 로 표시됩니다.
+  이후 republisher 가 주기적으로 재발행하며, 관리자 retry API 로 즉시 재시도할 수도 있습니다.
+- 주문/결제 상태 변경은 `order_events` 에 적재되고 같은 토픽으로 이벤트가 발행됩니다.
+
+| 메서드 | 경로 | 설명 |
+| --- | --- | --- |
+| `GET` | `/api/v1/admin/orders?status=&phone=&q=&from=&to=&limit=&offset=` | 관리자 주문 검색/페이지네이션 |
+| `GET` | `/api/v1/admin/orders/stats` | 상태별 주문 수/매출 통계 |
+| `GET` | `/api/v1/admin/order-jobs?status=&limit=` | 주문 작업 목록 |
+| `POST` | `/api/v1/admin/order-jobs/{id}/retry` | 실패/대기 작업 재발행 |
+| `POST` | `/api/v1/admin/order-jobs/{id}/cancel` | 대기/실패 작업 취소 |
+| `GET` | `/api/v1/admin/order-events?order_id=&event_type=&limit=` | 주문/결제 이벤트 감사 로그 |
+| `GET` | `/api/v1/admin/queue/stats` | 작업 상태/이벤트 수/컨슈머 오프셋 |
+| `GET` | `/api/v1/admin/cache/stats` | Redis 캐시 설정/키 수 |
+
+비동기 주문 예시:
+
+```bash
+curl -X POST http://localhost:8081/api/v1/orders/queue \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "customer_name": "홍길동",
+    "customer_phone": "010-1234-5678",
+    "delivery_address": "서울시 강남구",
+    "items": [{"item_id": "<inventory-uuid>", "quantity": 1}]
+  }'
+```
+
+### Redis 캐시
+
+주문 목록/상세, 재고 목록/상세, 관리자 주문 목록/통계에 cache-aside 를 적용합니다.
+기본 TTL 은 `CACHE_TTL_SECONDS` (30초) 이며, 주문/재고 변경 시 관련 prefix 를
+`SCAN` 으로 무효화합니다. Redis 장애 시 캐시는 미스로 처리되고 DB 조회로 폴백합니다.
+응답 헤더 `X-Cache: HIT|MISS` 로 캐시 상태를 확인할 수 있습니다.
 
 ## MQTT
 
@@ -136,6 +191,7 @@ HTTP `POST /api/v1/detections` 는 기존 연동 호환을 위해 그대로 유�
 ```bash
 psql "$DATABASE_URL" -f migrations/0001_create_detections.sql
 psql "$DATABASE_URL" -f migrations/0002_routes_deliveries_flights_orders.sql
+psql "$DATABASE_URL" -f migrations/0003_order_queue_cache.sql
 ```
 
 `platform` compose 에서는 `migrate` 서비스가 모든 마이그레이션을 순서대로 적용합니다.
@@ -150,7 +206,11 @@ psql "$DATABASE_URL" -f migrations/0002_routes_deliveries_flights_orders.sql
 | `LISTEN_ADDR` | `0.0.0.0:8081` |
 | `DATABASE_URL` | `postgres://neurovector:neurovector@localhost:5432/neurovector` |
 | `REDIS_URL` | `redis://:neurovector@localhost:6379/0` |
+| `CACHE_ENABLED` | `true` |
+| `CACHE_TTL_SECONDS` | `30` |
 | `KAFKA_BROKERS` | `localhost:9092` |
+| `KAFKA_TOPIC_EVENTS` | `neurovector.events` |
+| `KAFKA_TOPIC_ORDERS` | `neurovector.orders` |
 | `MQTT_HOST` / `MQTT_PORT` | `localhost` / `1883` |
 | `MEDIA_API_BASE_URL` | `http://localhost:9997` |
 | `MEDIA_WHEP_BASE_URL` | `http://localhost:8889` |
