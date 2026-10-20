@@ -12,6 +12,8 @@ pub struct AppState {
     /// 주문 비동기 큐 토픽 전용 publisher.
     pub order_queue: KafkaPublisher,
     pub media: MediaClient,
+    pub admin_session_ttl_seconds: u64,
+    pub admin_cookie_secure: bool,
     pub max_altitude_m: f64,
     pub route_max_leg_m: f64,
     pub route_max_distance_m: f64,

@@ -1,11 +1,20 @@
 use std::net::SocketAddr;
 
-use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
+use axum::{
+    Json, Router,
+    extract::State,
+    http::{HeaderValue, StatusCode},
+    routing::get,
+};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
+use tower_http::{
+    cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
+    trace::TraceLayer,
+};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+mod auth;
 mod cache;
 mod config;
 mod db;
@@ -44,6 +53,8 @@ async fn main() -> anyhow::Result<()> {
         .connect(&config.database_url)
         .await?;
 
+    auth::bootstrap_admin(&pool, &config.admin_username, &config.admin_password).await?;
+
     let redis = redis::Client::open(config.redis_url.clone())?;
 
     if let Err(err) = tokio::fs::create_dir_all(&config.media_recordings_dir).await {
@@ -73,6 +84,8 @@ async fn main() -> anyhow::Result<()> {
             config.media_srt_port,
             config.media_recordings_dir.clone(),
         ),
+        admin_session_ttl_seconds: config.admin_session_ttl_seconds,
+        admin_cookie_secure: config.admin_cookie_secure,
         max_altitude_m: config.max_altitude_m,
         route_max_leg_m: config.route_max_leg_m,
         route_max_distance_m: config.route_max_distance_m,
@@ -86,13 +99,30 @@ async fn main() -> anyhow::Result<()> {
     mqtt::spawn(state.clone(), &config);
     order_queue::spawn_worker(state.clone(), &config);
 
+    let cors_origins = config
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|origin| match origin.parse::<HeaderValue>() {
+            Ok(value) => Some(value),
+            Err(err) => {
+                tracing::warn!(origin, error = %err, "ignoring invalid CORS origin");
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::list(cors_origins))
+        .allow_credentials(true)
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request());
+
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health))
         .route("/health/ready", get(health_ready))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi()))
-        .nest("/api/v1", routes::router())
-        .layer(CorsLayer::permissive())
+        .nest("/api/v1", routes::router(state.clone()))
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -121,7 +151,7 @@ pub(crate) async fn root() -> Json<RootResponse> {
     Json(RootResponse {
         name: "neurovector-backend",
         version: env!("CARGO_PKG_VERSION"),
-        docs: "/swagger-ui, /api-docs/openapi.json, /health, /health/ready, /api/v1/detections, /api/v1/routes, /api/v1/deliveries, /api/v1/flights, /api/v1/risk, /api/v1/orders, /api/v1/admin/orders, /api/v1/inventory, /api/v1/streams, /api/v1/recordings",
+        docs: "/swagger-ui, /api-docs/openapi.json, /health, /health/ready, /api/v1/detections, /api/v1/routes, /api/v1/deliveries, /api/v1/flights, /api/v1/risk, /api/v1/orders, /api/v1/admin/auth/login, /api/v1/admin/orders, /api/v1/inventory, /api/v1/streams, /api/v1/recordings",
     })
 }
 

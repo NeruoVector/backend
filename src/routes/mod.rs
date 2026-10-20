@@ -12,15 +12,15 @@ pub mod risk;
 pub mod route_plans;
 pub mod streams;
 
-pub fn router() -> Router<AppState> {
+pub fn router(state: AppState) -> Router<AppState> {
     Router::new()
         .nest("/detections", detections::router())
         .nest("/routes", route_plans::router())
         .nest("/deliveries", deliveries::router())
         .nest("/flights", flights::router())
         .nest("/risk", risk::router())
-        .nest("/inventory", inventory::router())
-        .nest("/admin", admin::router())
+        .nest("/inventory", inventory::router(state.clone()))
+        .nest("/admin", admin::router(state))
         .merge(streams::router())
         .merge(orders::router())
 }

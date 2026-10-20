@@ -2,6 +2,7 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
+    middleware,
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
@@ -11,6 +12,7 @@ use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
 use crate::{
+    auth,
     cache::{Cache, CacheInfo},
     error::AppError,
     order_queue::{self, EnqueueOrderResponse, OrderEvent, OrderJob},
@@ -18,8 +20,8 @@ use crate::{
     state::AppState,
 };
 
-pub fn router() -> Router<AppState> {
-    Router::new()
+pub fn router(state: AppState) -> Router<AppState> {
+    let protected = Router::new()
         .route("/orders", get(admin_list_orders))
         .route("/orders/stats", get(admin_order_stats))
         .route("/order-jobs", get(admin_list_jobs))
@@ -28,6 +30,13 @@ pub fn router() -> Router<AppState> {
         .route("/order-events", get(admin_list_events))
         .route("/queue/stats", get(admin_queue_stats))
         .route("/cache/stats", get(admin_cache_stats))
+        .route("/auth/me", get(auth::me))
+        .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
+
+    Router::new()
+        .route("/auth/login", post(auth::login))
+        .route("/auth/logout", post(auth::logout))
+        .merge(protected)
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -121,6 +130,7 @@ pub struct QueueStats {
     path = "/api/v1/admin/orders",
     params(AdminOrderListParams),
     responses((status = 200, description = "관리자 주문 목록", body = AdminOrderList)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_list_orders(
@@ -221,6 +231,7 @@ pub(crate) async fn admin_list_orders(
     get,
     path = "/api/v1/admin/orders/stats",
     responses((status = 200, description = "주문 통계", body = AdminOrderStats)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_order_stats(
@@ -266,6 +277,7 @@ pub(crate) async fn admin_order_stats(
     path = "/api/v1/admin/order-jobs",
     params(ListJobsParams),
     responses((status = 200, description = "Kafka 주문 작업 목록", body = Vec<OrderJob>)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_list_jobs(
@@ -298,6 +310,7 @@ pub(crate) async fn admin_list_jobs(
         (status = 202, description = "재발행 접수", body = EnqueueOrderResponse),
         (status = 409, description = "재시도 불가 상태")
     ),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_retry_job(
@@ -316,6 +329,7 @@ pub(crate) async fn admin_retry_job(
         (status = 200, description = "작업 취소", body = OrderJob),
         (status = 409, description = "취소 불가 상태")
     ),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_cancel_job(
@@ -330,6 +344,7 @@ pub(crate) async fn admin_cancel_job(
     path = "/api/v1/admin/order-events",
     params(ListEventsParams),
     responses((status = 200, description = "주문 이벤트 목록", body = Vec<OrderEvent>)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_list_events(
@@ -359,6 +374,7 @@ pub(crate) async fn admin_list_events(
     get,
     path = "/api/v1/admin/queue/stats",
     responses((status = 200, description = "Kafka 큐 통계", body = QueueStats)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_queue_stats(
@@ -400,6 +416,7 @@ pub(crate) async fn admin_queue_stats(
     get,
     path = "/api/v1/admin/cache/stats",
     responses((status = 200, description = "Redis 캐시 통계", body = CacheInfo)),
+    security(("admin_session" = [])),
     tag = "admin"
 )]
 pub(crate) async fn admin_cache_stats(State(state): State<AppState>) -> Json<CacheInfo> {

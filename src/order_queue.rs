@@ -623,6 +623,8 @@ mod tests {
                 8890,
                 PathBuf::from("/tmp"),
             ),
+            admin_session_ttl_seconds: 86_400,
+            admin_cookie_secure: false,
             max_altitude_m: 120.0,
             route_max_leg_m: 5000.0,
             route_max_distance_m: 20_000.0,
