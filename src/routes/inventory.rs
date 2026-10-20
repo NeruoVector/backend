@@ -1,14 +1,15 @@
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::{error::AppError, state::AppState};
+use crate::{cache::Cache, error::AppError, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -17,7 +18,7 @@ pub fn router() -> Router<AppState> {
         .route("/{id}/restock", post(restock_item))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
 pub struct InventoryItem {
     pub id: Uuid,
     pub sku: String,
@@ -31,7 +32,8 @@ pub struct InventoryItem {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListItemsParams {
     #[serde(default)]
     pub active: Option<bool>,
@@ -39,7 +41,7 @@ pub struct ListItemsParams {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateItem {
     pub sku: String,
     pub name: String,
@@ -54,7 +56,7 @@ pub struct CreateItem {
     pub active: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateItem {
     #[serde(default)]
     pub name: Option<String>,
@@ -70,7 +72,7 @@ pub struct UpdateItem {
     pub active: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct RestockItem {
     pub quantity: i32,
 }
@@ -79,11 +81,31 @@ fn default_true() -> bool {
     true
 }
 
-async fn list_items(
+#[utoipa::path(
+    get,
+    path = "/api/v1/inventory",
+    params(ListItemsParams),
+    responses((status = 200, description = "재고 목록", body = Vec<InventoryItem>)),
+    tag = "inventory"
+)]
+pub(crate) async fn list_items(
     State(state): State<AppState>,
     Query(params): Query<ListItemsParams>,
-) -> Result<Json<Vec<InventoryItem>>, AppError> {
+) -> Result<(HeaderMap, Json<Vec<InventoryItem>>), AppError> {
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let key = format!(
+        "inventory:list:{}:{}",
+        params
+            .active
+            .map(|active| if active { "active" } else { "inactive" })
+            .unwrap_or("all"),
+        limit
+    );
+
+    if let Some(cached) = state.cache.get::<Vec<InventoryItem>>(&key).await {
+        return Ok((Cache::headers(true), Json(cached)));
+    }
+
     let items = sqlx::query_as::<_, InventoryItem>(
         r#"
         SELECT id, sku, name, description, unit_price, currency, stock_quantity,
@@ -99,17 +121,50 @@ async fn list_items(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(items))
+    if let Err(err) = state.cache.set(&key, &items).await {
+        tracing::warn!(error = %err, "failed to cache inventory list");
+    }
+
+    Ok((Cache::headers(false), Json(items)))
 }
 
-async fn get_item(
+#[utoipa::path(
+    get,
+    path = "/api/v1/inventory/{id}",
+    params(("id" = Uuid, Path, description = "상품 ID")),
+    responses(
+        (status = 200, description = "상품 상세", body = InventoryItem),
+        (status = 404, description = "상품 없음")
+    ),
+    tag = "inventory"
+)]
+pub(crate) async fn get_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<InventoryItem>, AppError> {
-    Ok(Json(fetch_item(&state, id).await?))
+) -> Result<(HeaderMap, Json<InventoryItem>), AppError> {
+    let key = format!("inventory:item:{id}");
+    if let Some(cached) = state.cache.get::<InventoryItem>(&key).await {
+        return Ok((Cache::headers(true), Json(cached)));
+    }
+
+    let item = fetch_item(&state, id).await?;
+    if let Err(err) = state.cache.set(&key, &item).await {
+        tracing::warn!(error = %err, "failed to cache inventory item");
+    }
+    Ok((Cache::headers(false), Json(item)))
 }
 
-async fn create_item(
+#[utoipa::path(
+    post,
+    path = "/api/v1/inventory",
+    request_body = CreateItem,
+    responses(
+        (status = 201, description = "상품 생성", body = InventoryItem),
+        (status = 409, description = "SKU 중복")
+    ),
+    tag = "inventory"
+)]
+pub(crate) async fn create_item(
     State(state): State<AppState>,
     Json(body): Json<CreateItem>,
 ) -> Result<(StatusCode, Json<InventoryItem>), AppError> {
@@ -142,10 +197,22 @@ async fn create_item(
     .await
     .map_err(map_inventory_error)?;
 
+    invalidate_inventory_cache(&state).await;
     Ok((StatusCode::CREATED, Json(item)))
 }
 
-async fn update_item(
+#[utoipa::path(
+    patch,
+    path = "/api/v1/inventory/{id}",
+    params(("id" = Uuid, Path, description = "상품 ID")),
+    request_body = UpdateItem,
+    responses(
+        (status = 200, description = "상품 수정", body = InventoryItem),
+        (status = 404, description = "상품 없음")
+    ),
+    tag = "inventory"
+)]
+pub(crate) async fn update_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateItem>,
@@ -186,10 +253,22 @@ async fn update_item(
     .fetch_one(&state.pool)
     .await?;
 
+    invalidate_inventory_cache(&state).await;
     Ok(Json(item))
 }
 
-async fn restock_item(
+#[utoipa::path(
+    post,
+    path = "/api/v1/inventory/{id}/restock",
+    params(("id" = Uuid, Path, description = "상품 ID")),
+    request_body = RestockItem,
+    responses(
+        (status = 200, description = "재고 입고", body = InventoryItem),
+        (status = 404, description = "상품 없음")
+    ),
+    tag = "inventory"
+)]
+pub(crate) async fn restock_item(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<RestockItem>,
@@ -213,6 +292,7 @@ async fn restock_item(
     .await?
     .ok_or(AppError::NotFound)?;
 
+    invalidate_inventory_cache(&state).await;
     Ok(Json(item))
 }
 
@@ -229,6 +309,12 @@ async fn fetch_item(state: &AppState, id: Uuid) -> Result<InventoryItem, AppErro
     .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)
+}
+
+pub(crate) async fn invalidate_inventory_cache(state: &AppState) {
+    if let Err(err) = state.cache.delete_prefix("inventory:").await {
+        tracing::warn!(error = %err, "failed to invalidate inventory cache");
+    }
 }
 
 fn validate_price_and_stock(unit_price: i64, stock_quantity: i32) -> Result<(), AppError> {

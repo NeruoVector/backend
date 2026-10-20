@@ -9,8 +9,11 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub redis_url: String,
+    pub cache_enabled: bool,
+    pub cache_ttl_seconds: u64,
     pub kafka_brokers: String,
     pub kafka_topic_events: String,
+    pub kafka_topic_orders: String,
 
     // MQTT (Mosquitto)
     pub mqtt_host: String,
@@ -51,11 +54,15 @@ impl Config {
         let database_max_connections = parse_env("DATABASE_MAX_CONNECTIONS", 10u32)?;
         let redis_url =
             env::var("REDIS_URL").context("REDIS_URL must be set (see .env.example)")?;
+        let cache_enabled = parse_env("CACHE_ENABLED", true)?;
+        let cache_ttl_seconds = parse_env("CACHE_TTL_SECONDS", 30u64)?;
 
         let kafka_brokers =
             env::var("KAFKA_BROKERS").unwrap_or_else(|_| "localhost:9092".to_string());
         let kafka_topic_events =
             env::var("KAFKA_TOPIC_EVENTS").unwrap_or_else(|_| "neurovector.events".to_string());
+        let kafka_topic_orders =
+            env::var("KAFKA_TOPIC_ORDERS").unwrap_or_else(|_| "neurovector.orders".to_string());
 
         let mqtt_host = env::var("MQTT_HOST").unwrap_or_else(|_| "localhost".to_string());
         let mqtt_port = parse_env("MQTT_PORT", 1883u16)?;
@@ -93,8 +100,11 @@ impl Config {
             database_url,
             database_max_connections,
             redis_url,
+            cache_enabled,
+            cache_ttl_seconds,
             kafka_brokers,
             kafka_topic_events,
+            kafka_topic_orders,
             mqtt_host,
             mqtt_port,
             mqtt_username,

@@ -67,11 +67,22 @@ impl KafkaPublisher {
     }
 
     pub async fn publish_detection(&self, event: &DetectionEvent<'_>) -> anyhow::Result<()> {
+        self.publish_json(Some(event.drone_id.as_bytes()), event)
+            .await
+    }
+
+    /// 임의의 JSON 레코드를 이 publisher 의 토픽으로 발행한다.
+    /// key 는 같은 업무 단위의 이벤트를 같은 파티션으로 보내는 데 사용한다.
+    pub async fn publish_json<T: Serialize + ?Sized>(
+        &self,
+        key: Option<&[u8]>,
+        event: &T,
+    ) -> anyhow::Result<()> {
         let partition = self.partition().await?;
         let payload = serde_json::to_vec(event)?;
 
         let record = Record {
-            key: Some(event.drone_id.as_bytes().to_vec()),
+            key: key.map(|key| key.to_vec()),
             value: Some(payload),
             headers: BTreeMap::new(),
             timestamp: Utc::now(),

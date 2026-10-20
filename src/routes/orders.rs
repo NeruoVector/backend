@@ -3,19 +3,23 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Json, Router,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, patch, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sqlx::{Postgres, Transaction};
+use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::{error::AppError, state::AppState};
+use crate::{cache::Cache, error::AppError, order_queue, state::AppState};
 
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/orders", get(list_orders).post(create_order))
+        .route("/orders/queue", post(enqueue_order))
+        .route("/orders/jobs/{id}", get(get_order_job))
         .route("/orders/{id}", get(get_order))
         .route("/orders/{id}/status", patch(update_order_status))
         .route(
@@ -26,7 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/payments/{id}/refund", post(refund_payment))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
 pub struct Order {
     pub id: Uuid,
     pub order_number: String,
@@ -46,7 +50,7 @@ pub struct Order {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
 pub struct OrderItem {
     pub id: Uuid,
     pub order_id: Uuid,
@@ -57,7 +61,7 @@ pub struct OrderItem {
     pub created_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
 pub struct Payment {
     pub id: Uuid,
     pub order_id: Uuid,
@@ -72,7 +76,7 @@ pub struct Payment {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct OrderDetail {
     #[serde(flatten)]
     pub order: Order,
@@ -80,7 +84,7 @@ pub struct OrderDetail {
     pub payment: Option<Payment>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct CreateOrder {
     pub customer_name: String,
     pub customer_phone: String,
@@ -98,13 +102,14 @@ pub struct CreateOrder {
     pub delivery_id: Option<Uuid>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct CreateOrderItem {
     pub item_id: Uuid,
     pub quantity: i32,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
+#[into_params(parameter_in = Query)]
 pub struct ListOrdersParams {
     #[serde(default)]
     pub status: Option<String>,
@@ -114,12 +119,12 @@ pub struct ListOrdersParams {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct UpdateOrderStatus {
     pub status: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct CreatePayment {
     #[serde(default)]
     pub method: Option<String>,
@@ -138,11 +143,29 @@ struct StockItem {
     active: bool,
 }
 
-async fn list_orders(
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders",
+    params(ListOrdersParams),
+    responses((status = 200, description = "주문 목록", body = Vec<Order>)),
+    tag = "orders"
+)]
+pub(crate) async fn list_orders(
     State(state): State<AppState>,
     Query(params): Query<ListOrdersParams>,
-) -> Result<Json<Vec<Order>>, AppError> {
+) -> Result<(HeaderMap, Json<Vec<Order>>), AppError> {
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
+    let key = format!(
+        "orders:list:{}:{}:{}",
+        params.status.as_deref().unwrap_or("-"),
+        params.phone.as_deref().unwrap_or("-"),
+        limit
+    );
+
+    if let Some(cached) = state.cache.get::<Vec<Order>>(&key).await {
+        return Ok((Cache::headers(true), Json(cached)));
+    }
+
     let orders = sqlx::query_as::<_, Order>(
         r#"
         SELECT id, order_number, customer_name, customer_phone, status, total_amount,
@@ -161,27 +184,49 @@ async fn list_orders(
     .fetch_all(&state.pool)
     .await?;
 
-    Ok(Json(orders))
+    if let Err(err) = state.cache.set(&key, &orders).await {
+        tracing::warn!(error = %err, "failed to cache order list");
+    }
+
+    Ok((Cache::headers(false), Json(orders)))
 }
 
-async fn get_order(
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders/{id}",
+    params(("id" = Uuid, Path, description = "주문 ID")),
+    responses(
+        (status = 200, description = "주문 상세", body = OrderDetail),
+        (status = 404, description = "주문 없음")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn get_order(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<OrderDetail>, AppError> {
+) -> Result<(HeaderMap, Json<OrderDetail>), AppError> {
+    let key = format!("orders:detail:{id}");
+    if let Some(cached) = state.cache.get::<OrderDetail>(&key).await {
+        return Ok((Cache::headers(true), Json(cached)));
+    }
+
     let order = fetch_order(&state, id).await?;
     let items = fetch_order_items(&state, id).await?;
     let payment = fetch_latest_payment(&state, id).await?;
-    Ok(Json(OrderDetail {
+    let detail = OrderDetail {
         order,
         items,
         payment,
-    }))
+    };
+
+    if let Err(err) = state.cache.set(&key, &detail).await {
+        tracing::warn!(error = %err, "failed to cache order detail");
+    }
+
+    Ok((Cache::headers(false), Json(detail)))
 }
 
-async fn create_order(
-    State(state): State<AppState>,
-    Json(body): Json<CreateOrder>,
-) -> Result<(StatusCode, Json<OrderDetail>), AppError> {
+pub(crate) fn validate_create_order(body: &CreateOrder) -> Result<(), AppError> {
     if body.customer_name.trim().is_empty() {
         return Err(AppError::BadRequest("customer_name is required".into()));
     }
@@ -230,14 +275,20 @@ async fn create_order(
         }
     }
 
-    let mut tx = state.pool.begin().await?;
+    Ok(())
+}
 
+/// 동기 API 와 Kafka worker 가 공유하는 주문 생성 트랜잭션.
+pub(crate) async fn create_order_in_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    body: &CreateOrder,
+) -> Result<OrderDetail, AppError> {
     if let Some(delivery_id) = body.delivery_id {
         let exists = sqlx::query_scalar::<_, bool>(
             "SELECT EXISTS(SELECT 1 FROM neurovector.deliveries WHERE id = $1)",
         )
         .bind(delivery_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         if !exists {
             return Err(AppError::BadRequest("delivery_id does not exist".into()));
@@ -258,7 +309,7 @@ async fn create_order(
             "#,
         )
         .bind(requested.item_id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| AppError::BadRequest("order item does not exist".into()))?;
 
@@ -300,7 +351,7 @@ async fn create_order(
         )
         .bind(item.id)
         .bind(requested.quantity)
-        .execute(&mut *tx)
+        .execute(&mut **tx)
         .await?;
 
         line_items.push((item.id, requested.quantity, item.unit_price, line_total));
@@ -335,7 +386,7 @@ async fn create_order(
     .bind(body.longitude)
     .bind(body.notes.as_deref())
     .bind(body.delivery_id)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await?;
 
     let mut items = Vec::with_capacity(line_items.len());
@@ -353,24 +404,118 @@ async fn create_order(
         .bind(quantity)
         .bind(unit_price)
         .bind(line_total)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await?;
         items.push(item);
     }
 
-    tx.commit().await?;
-
-    Ok((
-        StatusCode::CREATED,
-        Json(OrderDetail {
-            order,
-            items,
-            payment: None,
-        }),
-    ))
+    Ok(OrderDetail {
+        order,
+        items,
+        payment: None,
+    })
 }
 
-async fn update_order_status(
+#[utoipa::path(
+    post,
+    path = "/api/v1/orders",
+    request_body = CreateOrder,
+    responses(
+        (status = 201, description = "주문 생성", body = OrderDetail),
+        (status = 400, description = "잘못된 요청"),
+        (status = 409, description = "재고/상태 충돌")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn create_order(
+    State(state): State<AppState>,
+    Json(body): Json<CreateOrder>,
+) -> Result<(StatusCode, Json<OrderDetail>), AppError> {
+    validate_create_order(&body)?;
+
+    let mut tx = state.pool.begin().await?;
+    let detail = create_order_in_tx(&mut tx, &body).await?;
+    tx.commit().await?;
+
+    invalidate_order_cache(&state).await;
+    order_queue::publish_order_event(
+        &state,
+        "order.created",
+        detail.order.id,
+        None,
+        json!({
+            "order_number": &detail.order.order_number,
+            "status": &detail.order.status,
+            "total_amount": detail.order.total_amount,
+            "currency": &detail.order.currency,
+            "source": "sync_api",
+        }),
+    )
+    .await;
+
+    Ok((StatusCode::CREATED, Json(detail)))
+}
+
+/// Kafka 로 주문 생성을 비동기 처리한다. 응답은 202 이며 `/orders/jobs/{id}` 로
+/// 작업 상태를 조회할 수 있다.
+#[utoipa::path(
+    post,
+    path = "/api/v1/orders/queue",
+    request_body = CreateOrder,
+    responses(
+        (status = 202, description = "Kafka 주문 작업 접수", body = order_queue::EnqueueOrderResponse),
+        (status = 400, description = "잘못된 요청")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn enqueue_order(
+    State(state): State<AppState>,
+    Json(body): Json<CreateOrder>,
+) -> Result<(StatusCode, Json<order_queue::EnqueueOrderResponse>), AppError> {
+    let response = order_queue::enqueue_create_order(&state, body).await?;
+    Ok((StatusCode::ACCEPTED, Json(response)))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders/jobs/{id}",
+    params(("id" = Uuid, Path, description = "주문 작업 ID")),
+    responses(
+        (status = 200, description = "주문 작업 상태", body = order_queue::OrderJob),
+        (status = 404, description = "작업 없음")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn get_order_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<order_queue::OrderJob>, AppError> {
+    Ok(Json(order_queue::get_job(&state.pool, id).await?))
+}
+
+pub(crate) async fn invalidate_order_cache(state: &AppState) {
+    if let Err(err) = state.cache.delete_prefix("orders:").await {
+        tracing::warn!(error = %err, "failed to invalidate order cache");
+    }
+    if let Err(err) = state.cache.delete_prefix("admin:orders:").await {
+        tracing::warn!(error = %err, "failed to invalidate admin order cache");
+    }
+    // 주문 생성/취소/환불은 재고 수량을 바꾸므로 재고 캐시도 함께 무효화한다.
+    crate::routes::inventory::invalidate_inventory_cache(state).await;
+}
+
+#[utoipa::path(
+    patch,
+    path = "/api/v1/orders/{id}/status",
+    params(("id" = Uuid, Path, description = "주문 ID")),
+    request_body = UpdateOrderStatus,
+    responses(
+        (status = 200, description = "상태 변경", body = Order),
+        (status = 409, description = "허용되지 않은 상태 전이")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn update_order_status(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<UpdateOrderStatus>,
@@ -405,10 +550,33 @@ async fn update_order_status(
     .await?;
 
     tx.commit().await?;
+
+    invalidate_order_cache(&state).await;
+    order_queue::publish_order_event(
+        &state,
+        "order.status_changed",
+        order.id,
+        None,
+        json!({
+            "order_number": &order.order_number,
+            "previous_status": current.status,
+            "status": &order.status,
+            "stock_restored": stock_restored,
+        }),
+    )
+    .await;
+
     Ok(Json(order))
 }
 
-async fn list_order_payments(
+#[utoipa::path(
+    get,
+    path = "/api/v1/orders/{id}/payments",
+    params(("id" = Uuid, Path, description = "주문 ID")),
+    responses((status = 200, description = "결제 목록", body = Vec<Payment>)),
+    tag = "orders"
+)]
+pub(crate) async fn list_order_payments(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Vec<Payment>>, AppError> {
@@ -427,7 +595,19 @@ async fn list_order_payments(
     Ok(Json(payments))
 }
 
-async fn pay_order(
+#[utoipa::path(
+    post,
+    path = "/api/v1/orders/{id}/payments",
+    params(("id" = Uuid, Path, description = "주문 ID")),
+    request_body = CreatePayment,
+    responses(
+        (status = 201, description = "더미 결제 성공", body = Payment),
+        (status = 402, description = "더미 결제 실패", body = Payment),
+        (status = 409, description = "결제 불가 상태")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn pay_order(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Json(body): Json<CreatePayment>,
@@ -504,6 +684,28 @@ async fn pay_order(
 
     tx.commit().await?;
 
+    invalidate_order_cache(&state).await;
+    let event_type = if status == "captured" {
+        "payment.captured"
+    } else {
+        "payment.failed"
+    };
+    order_queue::publish_order_event(
+        &state,
+        event_type,
+        payment.order_id,
+        None,
+        json!({
+            "payment_id": payment.id,
+            "status": &payment.status,
+            "amount": payment.amount,
+            "currency": &payment.currency,
+            "transaction_id": &payment.transaction_id,
+            "failure_reason": &payment.failure_reason,
+        }),
+    )
+    .await;
+
     let code = if status == "captured" {
         StatusCode::CREATED
     } else {
@@ -512,7 +714,17 @@ async fn pay_order(
     Ok((code, Json(payment)))
 }
 
-async fn get_payment(
+#[utoipa::path(
+    get,
+    path = "/api/v1/payments/{id}",
+    params(("id" = Uuid, Path, description = "결제 ID")),
+    responses(
+        (status = 200, description = "결제 상세", body = Payment),
+        (status = 404, description = "결제 없음")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn get_payment(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Payment>, AppError> {
@@ -531,7 +743,17 @@ async fn get_payment(
     Ok(Json(payment))
 }
 
-async fn refund_payment(
+#[utoipa::path(
+    post,
+    path = "/api/v1/payments/{id}/refund",
+    params(("id" = Uuid, Path, description = "결제 ID")),
+    responses(
+        (status = 200, description = "환불 처리", body = Payment),
+        (status = 409, description = "환불 불가 상태")
+    ),
+    tag = "orders"
+)]
+pub(crate) async fn refund_payment(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Payment>, AppError> {
@@ -590,6 +812,24 @@ async fn refund_payment(
     }
 
     tx.commit().await?;
+
+    invalidate_order_cache(&state).await;
+    order_queue::publish_order_event(
+        &state,
+        "payment.refunded",
+        payment.order_id,
+        None,
+        json!({
+            "payment_id": payment.id,
+            "order_id": payment.order_id,
+            "status": &payment.status,
+            "amount": payment.amount,
+            "currency": &payment.currency,
+            "order_status": &order.status,
+        }),
+    )
+    .await;
+
     Ok(Json(payment))
 }
 
@@ -717,4 +957,47 @@ fn validate_order_transition(current: &str, next: &str) -> Result<(), AppError> 
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_order() -> CreateOrder {
+        CreateOrder {
+            customer_name: "Test User".into(),
+            customer_phone: "010-0000-0000".into(),
+            items: vec![CreateOrderItem {
+                item_id: Uuid::new_v4(),
+                quantity: 1,
+            }],
+            delivery_address: "Seoul".into(),
+            delivery_detail: None,
+            latitude: Some(37.5),
+            longitude: Some(127.0),
+            notes: None,
+            delivery_id: None,
+        }
+    }
+
+    #[test]
+    fn accepts_valid_order() {
+        assert!(validate_create_order(&valid_order()).is_ok());
+    }
+
+    #[test]
+    fn rejects_duplicate_items_and_bad_coordinates() {
+        let mut order = valid_order();
+        order.items.push(order.items[0].clone());
+        assert!(validate_create_order(&order).is_err());
+
+        let mut order = valid_order();
+        order.latitude = Some(120.0);
+        assert!(validate_create_order(&order).is_err());
+
+        let mut order = valid_order();
+        order.latitude = Some(37.5);
+        order.longitude = None;
+        assert!(validate_create_order(&order).is_err());
+    }
 }
