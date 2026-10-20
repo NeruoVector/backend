@@ -2,20 +2,27 @@ use axum::{
     Json, Router,
     extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
+    middleware,
+    routing::{get, patch, post},
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
-use crate::{cache::Cache, error::AppError, state::AppState};
+use crate::{auth, cache::Cache, error::AppError, state::AppState};
 
-pub fn router() -> Router<AppState> {
-    Router::new()
-        .route("/", get(list_items).post(create_item))
-        .route("/{id}", get(get_item).patch(update_item))
+pub fn router(state: AppState) -> Router<AppState> {
+    let protected = Router::new()
+        .route("/", post(create_item))
+        .route("/{id}", patch(update_item))
         .route("/{id}/restock", post(restock_item))
+        .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
+
+    Router::new()
+        .route("/", get(list_items))
+        .route("/{id}", get(get_item))
+        .merge(protected)
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
@@ -162,6 +169,7 @@ pub(crate) async fn get_item(
         (status = 201, description = "상품 생성", body = InventoryItem),
         (status = 409, description = "SKU 중복")
     ),
+    security(("admin_session" = [])),
     tag = "inventory"
 )]
 pub(crate) async fn create_item(
@@ -210,6 +218,7 @@ pub(crate) async fn create_item(
         (status = 200, description = "상품 수정", body = InventoryItem),
         (status = 404, description = "상품 없음")
     ),
+    security(("admin_session" = [])),
     tag = "inventory"
 )]
 pub(crate) async fn update_item(
@@ -266,6 +275,7 @@ pub(crate) async fn update_item(
         (status = 200, description = "재고 입고", body = InventoryItem),
         (status = 404, description = "상품 없음")
     ),
+    security(("admin_session" = [])),
     tag = "inventory"
 )]
 pub(crate) async fn restock_item(

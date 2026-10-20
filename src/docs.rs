@@ -1,22 +1,44 @@
-use utoipa::OpenApi;
+use utoipa::{
+    OpenApi,
+    openapi::security::{ApiKey, ApiKeyValue, SecurityScheme},
+};
+
+struct SecurityAddon;
+
+impl utoipa::Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "admin_session",
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::new(
+                    crate::auth::SESSION_COOKIE_NAME,
+                ))),
+            );
+        }
+    }
+}
 
 #[derive(OpenApi)]
 #[openapi(
     info(
         title = "NeuroVector API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "드론 배송, 비전 감지, 주문/재고/결제, 관리자 큐 API"
+        description = "드론 배송, 비전 감지, 주문/재고/결제, 관리자 세션 로그인/큐 API"
     ),
     tags(
         (name = "orders", description = "주문 생성, 결제, Kafka 비동기 주문"),
         (name = "inventory", description = "상품 재고"),
-        (name = "admin", description = "주문 관리, Kafka 큐, Redis 캐시 통계"),
+        (name = "admin", description = "관리자 로그인, 주문 관리, Kafka 큐, Redis 캐시 통계"),
         (name = "system", description = "상태 확인")
     ),
+    modifiers(&SecurityAddon),
     paths(
         crate::root,
         crate::health,
         crate::health_ready,
+        crate::auth::login,
+        crate::auth::logout,
+        crate::auth::me,
         crate::routes::orders::list_orders,
         crate::routes::orders::create_order,
         crate::routes::orders::enqueue_order,
@@ -45,6 +67,8 @@ use utoipa::OpenApi;
         crate::RootResponse,
         crate::HealthResponse,
         crate::ReadinessResponse,
+        crate::auth::LoginRequest,
+        crate::auth::AdminSessionInfo,
         crate::routes::orders::Order,
         crate::routes::orders::OrderItem,
         crate::routes::orders::OrderDetail,
@@ -83,6 +107,18 @@ mod tests {
         assert!(paths.get("/api/v1/orders/jobs/{id}").is_some());
         assert!(paths.get("/api/v1/admin/order-jobs/{id}/retry").is_some());
         assert!(paths.get("/api/v1/admin/cache/stats").is_some());
+        assert!(paths.get("/api/v1/admin/auth/login").is_some());
+        assert!(paths.get("/api/v1/admin/auth/me").is_some());
+        assert!(
+            value["paths"]["/api/v1/admin/orders"]["get"]
+                .get("security")
+                .is_some()
+        );
+        assert!(
+            value["components"]["securitySchemes"]
+                .get("admin_session")
+                .is_some()
+        );
         assert!(
             value["components"]["schemas"]
                 .get("EnqueueOrderResponse")

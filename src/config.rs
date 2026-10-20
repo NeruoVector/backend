@@ -15,6 +15,13 @@ pub struct Config {
     pub kafka_topic_events: String,
     pub kafka_topic_orders: String,
 
+    // 관리자 세션 로그인
+    pub admin_username: String,
+    pub admin_password: String,
+    pub admin_session_ttl_seconds: u64,
+    pub admin_cookie_secure: bool,
+    pub cors_allowed_origins: Vec<String>,
+
     // MQTT (Mosquitto)
     pub mqtt_host: String,
     pub mqtt_port: u16,
@@ -64,6 +71,22 @@ impl Config {
         let kafka_topic_orders =
             env::var("KAFKA_TOPIC_ORDERS").unwrap_or_else(|_| "neurovector.orders".to_string());
 
+        let admin_username = env::var("ADMIN_USERNAME").unwrap_or_else(|_| "admin".to_string());
+        let admin_password =
+            env::var("ADMIN_PASSWORD").unwrap_or_else(|_| "neurovector-admin".to_string());
+        let admin_session_ttl_seconds = parse_env("ADMIN_SESSION_TTL_SECONDS", 86_400u64)?;
+        let admin_cookie_secure = parse_env("ADMIN_COOKIE_SECURE", false)?;
+        let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
+            .unwrap_or_else(|_| {
+                "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8081,http://127.0.0.1:8081"
+                    .to_string()
+            })
+            .split(',')
+            .map(str::trim)
+            .filter(|origin| !origin.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+
         let mqtt_host = env::var("MQTT_HOST").unwrap_or_else(|_| "localhost".to_string());
         let mqtt_port = parse_env("MQTT_PORT", 1883u16)?;
         let mqtt_username = env::var("MQTT_USERNAME").unwrap_or_else(|_| "neurovector".to_string());
@@ -105,6 +128,11 @@ impl Config {
             kafka_brokers,
             kafka_topic_events,
             kafka_topic_orders,
+            admin_username,
+            admin_password,
+            admin_session_ttl_seconds,
+            admin_cookie_secure,
+            cors_allowed_origins,
             mqtt_host,
             mqtt_port,
             mqtt_username,
