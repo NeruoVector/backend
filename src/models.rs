@@ -12,6 +12,8 @@ pub struct Detection {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub distance_m: Option<f64>,
+    /// 1=얼굴/신체/동물, 2=차량/사물, 3=나뭇잎 등 저위험 자연물
+    pub priority_level: i16,
     pub detected_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -25,6 +27,8 @@ pub struct CreateDetection {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub distance_m: Option<f64>,
+    #[serde(default)]
+    pub priority_level: Option<i16>,
     pub detected_at: Option<DateTime<Utc>>,
 }
 

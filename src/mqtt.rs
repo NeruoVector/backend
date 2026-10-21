@@ -170,6 +170,7 @@ async fn handle_publish(state: &AppState, config: &MqttConfig, topic: &str, payl
                 latitude: payload.latitude,
                 longitude: payload.longitude,
                 distance_m: payload.distance_m,
+                priority_level: payload.priority_level,
                 detected_at: payload.detected_at,
             };
 
@@ -264,5 +265,7 @@ struct DetectionPayload {
     latitude: Option<f64>,
     longitude: Option<f64>,
     distance_m: Option<f64>,
+    #[serde(default)]
+    priority_level: Option<i16>,
     detected_at: Option<DateTime<Utc>>,
 }
