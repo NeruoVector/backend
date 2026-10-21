@@ -135,7 +135,7 @@ async fn predict(
     let mut detections = sqlx::query_as::<_, Detection>(
         r#"
         SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
-               detected_at, created_at
+               priority_level, detected_at, created_at
         FROM neurovector.detections
         WHERE detected_at >= $1
           AND ($2::text IS NULL OR drone_id = $2)

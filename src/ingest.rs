@@ -12,6 +12,26 @@ use crate::{
     state::AppState,
 };
 
+/// vision 이 priority_level 을 보내지 않는 구버전/MQTT 클라이언트용 최소 매핑.
+fn default_priority_level(label: &str) -> i16 {
+    let normalized = label.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "face" | "body" | "torso" | "arm" | "hand" | "leg" | "foot" | "left_arm" | "right_arm"
+        | "left_hand" | "right_hand" | "left_leg" | "right_leg" | "left_foot" | "right_foot"
+        | "person" | "people" | "human" | "pedestrian" | "animal" | "cat" | "dog" | "bird"
+        | "horse" | "sheep" | "cow" | "elephant" | "bear" | "zebra" | "giraffe" | "얼굴"
+        | "신체" | "몸통" | "팔" | "손" | "다리" | "발" | "사람" | "보행자" | "동물" | "고양이"
+        | "개" | "강아지" | "새" | "말" | "양" | "소" | "코끼리" | "곰" | "얼룩말" | "기린" => {
+            1
+        }
+        "leaf" | "leaves" | "fallen leaf" | "tree leaf" | "leaf litter" | "grass" | "flower"
+        | "flowers" | "petal" | "petals" | "나뭇잎" | "낙엽" | "잎" | "풀" | "꽃" | "꽃잎" => {
+            3
+        }
+        _ => 2,
+    }
+}
+
 pub async fn ingest_detection(
     state: &AppState,
     body: CreateDetection,
@@ -48,14 +68,23 @@ pub async fn ingest_detection(
             "distance_m must be a non-negative finite number".into(),
         ));
     }
+    let priority_level = body
+        .priority_level
+        .unwrap_or_else(|| default_priority_level(&body.label));
+    if !(1..=3).contains(&priority_level) {
+        return Err(AppError::BadRequest(
+            "priority_level must be between 1 and 3".into(),
+        ));
+    }
 
     let detection = sqlx::query_as::<_, Detection>(
         r#"
         INSERT INTO neurovector.detections
-            (drone_id, label, confidence, latitude, longitude, distance_m, detected_at)
-        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+            (drone_id, label, confidence, latitude, longitude, distance_m,
+             priority_level, detected_at)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, COALESCE($8, now()))
         RETURNING id, drone_id, label, confidence, latitude, longitude, distance_m,
-                  detected_at, created_at
+                  priority_level, detected_at, created_at
         "#,
     )
     .bind(&body.drone_id)
@@ -64,6 +93,7 @@ pub async fn ingest_detection(
     .bind(body.latitude)
     .bind(body.longitude)
     .bind(body.distance_m)
+    .bind(priority_level)
     .bind(body.detected_at)
     .fetch_one(&state.pool)
     .await?;
@@ -74,6 +104,7 @@ pub async fn ingest_detection(
         label: &detection.label,
         confidence: detection.confidence,
         distance_m: detection.distance_m,
+        priority_level: detection.priority_level,
         detected_at: detection.detected_at,
     };
 
