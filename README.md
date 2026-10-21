@@ -208,11 +208,14 @@ Mosquitto 브로커는 `platform` compose 의 `mosquitto` 서비스입니다. �
 
 | 토픽 | 페이로드 |
 | --- | --- |
-| `neurovector/drones/{drone_id}/detections` | `{"label":"person","confidence":0.91,"latitude":37.5,"longitude":127.0}` |
+| `neurovector/drones/{drone_id}/detections` | `{"label":"person","confidence":0.91,"latitude":37.5,"longitude":127.0,"distance_m":12.4}` |
 | `neurovector/drones/{drone_id}/telemetry` | `{"latitude":37.5,"longitude":127.0,"altitude_m":30,"speed_mps":8,"battery_pct":82,"status":"in_flight"}` |
 | `neurovector/drones/{drone_id}/status` | `{"online":true,"status":"ready"}` |
 
 HTTP `POST /api/v1/detections` 는 기존 연동 호환을 위해 그대로 유지됩니다.
+`distance_m` 은 선택 필드이며, vision 서비스가 단안 카메라로 추정한 거리(미터)를
+전달합니다. 값이 없으면 `null` 로 저장됩니다.
+
 텔레메트리는 `status` 값이 `in_flight`/`armed` 등이면 비행 세션을 자동 시작하고,
 `landed`/`completed`/`idle`/`failed` 등이면 세션을 종료합니다.
 
@@ -223,6 +226,7 @@ psql "$DATABASE_URL" -f migrations/0001_create_detections.sql
 psql "$DATABASE_URL" -f migrations/0002_routes_deliveries_flights_orders.sql
 psql "$DATABASE_URL" -f migrations/0003_order_queue_cache.sql
 psql "$DATABASE_URL" -f migrations/0004_admin_auth.sql
+psql "$DATABASE_URL" -f migrations/0005_detection_distance.sql
 ```
 
 `platform` compose 에서는 `migrate` 서비스가 모든 마이그레이션을 순서대로 적용합니다.

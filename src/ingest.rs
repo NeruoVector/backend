@@ -41,13 +41,21 @@ pub async fn ingest_detection(
             "longitude must be between -180 and 180".into(),
         ));
     }
+    if let Some(distance) = body.distance_m
+        && (!distance.is_finite() || distance < 0.0)
+    {
+        return Err(AppError::BadRequest(
+            "distance_m must be a non-negative finite number".into(),
+        ));
+    }
 
     let detection = sqlx::query_as::<_, Detection>(
         r#"
         INSERT INTO neurovector.detections
-            (drone_id, label, confidence, latitude, longitude, detected_at)
-        VALUES ($1, $2, $3, $4, $5, COALESCE($6, now()))
-        RETURNING id, drone_id, label, confidence, latitude, longitude, detected_at, created_at
+            (drone_id, label, confidence, latitude, longitude, distance_m, detected_at)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()))
+        RETURNING id, drone_id, label, confidence, latitude, longitude, distance_m,
+                  detected_at, created_at
         "#,
     )
     .bind(&body.drone_id)
@@ -55,6 +63,7 @@ pub async fn ingest_detection(
     .bind(body.confidence)
     .bind(body.latitude)
     .bind(body.longitude)
+    .bind(body.distance_m)
     .bind(body.detected_at)
     .fetch_one(&state.pool)
     .await?;
@@ -64,6 +73,7 @@ pub async fn ingest_detection(
         drone_id: &detection.drone_id,
         label: &detection.label,
         confidence: detection.confidence,
+        distance_m: detection.distance_m,
         detected_at: detection.detected_at,
     };
 

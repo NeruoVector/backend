@@ -36,7 +36,8 @@ async fn list_detections(
 
     let rows = sqlx::query_as::<_, Detection>(
         r#"
-        SELECT id, drone_id, label, confidence, latitude, longitude, detected_at, created_at
+        SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
+               detected_at, created_at
         FROM neurovector.detections
         ORDER BY detected_at DESC
         LIMIT $1
@@ -65,7 +66,8 @@ async fn get_detection(
 ) -> Result<Json<Detection>, AppError> {
     let detection = sqlx::query_as::<_, Detection>(
         r#"
-        SELECT id, drone_id, label, confidence, latitude, longitude, detected_at, created_at
+        SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
+               detected_at, created_at
         FROM neurovector.detections
         WHERE id = $1
         "#,

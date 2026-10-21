@@ -169,6 +169,7 @@ async fn handle_publish(state: &AppState, config: &MqttConfig, topic: &str, payl
                 confidence: payload.confidence,
                 latitude: payload.latitude,
                 longitude: payload.longitude,
+                distance_m: payload.distance_m,
                 detected_at: payload.detected_at,
             };
 
@@ -262,5 +263,6 @@ struct DetectionPayload {
     confidence: f32,
     latitude: Option<f64>,
     longitude: Option<f64>,
+    distance_m: Option<f64>,
     detected_at: Option<DateTime<Utc>>,
 }

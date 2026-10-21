@@ -11,6 +11,7 @@ pub struct Detection {
     pub confidence: f32,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub distance_m: Option<f64>,
     pub detected_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
@@ -23,6 +24,7 @@ pub struct CreateDetection {
     pub confidence: f32,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    pub distance_m: Option<f64>,
     pub detected_at: Option<DateTime<Utc>>,
 }
 
