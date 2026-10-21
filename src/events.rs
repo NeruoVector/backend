@@ -19,6 +19,7 @@ pub struct DetectionEvent<'a> {
     pub drone_id: &'a str,
     pub label: &'a str,
     pub confidence: f32,
+    pub distance_m: Option<f64>,
     pub detected_at: DateTime<Utc>,
 }
 
