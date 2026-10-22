@@ -29,10 +29,14 @@ impl utoipa::Modify for SecurityAddon {
         (name = "orders", description = "주문 생성, 결제, Kafka 비동기 주문"),
         (name = "inventory", description = "상품 재고"),
         (name = "admin", description = "관리자 로그인, 주문 관리, Kafka 큐, Redis 캐시 통계"),
-        (name = "system", description = "상태 확인")
+        (name = "system", description = "상태 확인"),
+        (name = "routes", description = "경로 계획·창문 수령·드론 교차 검증")
     ),
     modifiers(&SecurityAddon),
     paths(
+        crate::mission::create_plan,
+        crate::mission::get_plan,
+        crate::mission::cross_check,
         crate::root,
         crate::health,
         crate::health_ready,
@@ -64,6 +68,10 @@ impl utoipa::Modify for SecurityAddon {
         crate::routes::admin::admin_cache_stats
     ),
     components(schemas(
+        crate::mission::PlanInput,
+        crate::mission::MissionPlan,
+        crate::mission::CrossCheck,
+        crate::mission::WindowTarget,
         crate::RootResponse,
         crate::HealthResponse,
         crate::ReadinessResponse,

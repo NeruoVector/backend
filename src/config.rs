@@ -9,6 +9,7 @@ pub struct Config {
     pub database_url: String,
     pub database_max_connections: u32,
     pub redis_url: String,
+    pub redis_timeout_ms: u64,
     pub cache_enabled: bool,
     pub cache_ttl_seconds: u64,
     pub kafka_brokers: String,
@@ -61,6 +62,7 @@ impl Config {
         let database_max_connections = parse_env("DATABASE_MAX_CONNECTIONS", 10u32)?;
         let redis_url =
             env::var("REDIS_URL").context("REDIS_URL must be set (see .env.example)")?;
+        let redis_timeout_ms = parse_env("REDIS_TIMEOUT_MS", 500u64)?.max(1);
         let cache_enabled = parse_env("CACHE_ENABLED", true)?;
         let cache_ttl_seconds = parse_env("CACHE_TTL_SECONDS", 30u64)?;
 
@@ -117,12 +119,31 @@ impl Config {
         let risk_corridor_m = parse_env("RISK_CORRIDOR_M", 150.0f64)?;
         let telemetry_online_ttl_seconds = parse_env("TELEMETRY_ONLINE_TTL_SECONDS", 120u64)?;
 
+        for (name, value) in [
+            ("MAX_ALTITUDE_M", max_altitude_m),
+            ("ROUTE_MAX_LEG_M", route_max_leg_m),
+            ("ROUTE_MAX_DISTANCE_M", route_max_distance_m),
+            ("ROUTE_BATTERY_WH", route_battery_wh),
+            ("ROUTE_POWER_W", route_power_w),
+            ("RISK_CORRIDOR_M", risk_corridor_m),
+        ] {
+            anyhow::ensure!(
+                value.is_finite() && value > 0.0,
+                "{name} must be finite and positive"
+            );
+        }
+        anyhow::ensure!(
+            database_max_connections > 0,
+            "DATABASE_MAX_CONNECTIONS must be positive"
+        );
+
         Ok(Self {
             listen_addr,
             public_base_url,
             database_url,
             database_max_connections,
             redis_url,
+            redis_timeout_ms,
             cache_enabled,
             cache_ttl_seconds,
             kafka_brokers,

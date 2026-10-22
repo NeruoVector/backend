@@ -160,13 +160,14 @@ async fn create_delivery(
         )));
     }
 
-    let overlap = sqlx::query_scalar::<_, i64>(
+    let overlap = sqlx::query_scalar::<_, bool>(
         r#"
-        SELECT count(*)
+        SELECT EXISTS(SELECT 1
         FROM neurovector.deliveries
         WHERE drone_id = $1
           AND status IN ('scheduled', 'dispatched')
-          AND abs(extract(epoch FROM (scheduled_at - $2))) < 600
+          AND scheduled_at > $2::timestamptz - interval '10 minutes'
+          AND scheduled_at < $2::timestamptz + interval '10 minutes')
         "#,
     )
     .bind(&body.drone_id)
@@ -174,7 +175,7 @@ async fn create_delivery(
     .fetch_one(&state.pool)
     .await?;
 
-    if overlap > 0 {
+    if overlap {
         return Err(AppError::Conflict(
             "another delivery for this drone is scheduled within 10 minutes".into(),
         ));
@@ -218,6 +219,10 @@ async fn update_status(
     .ok_or(AppError::NotFound)?;
 
     validate_transition(&current.status, &body.status)?;
+    if matches!(body.status.as_str(), "dispatched" | "in_flight") {
+        crate::mission::verify_route_for_dispatch(&state, current.route_id, &current.drone_id)
+            .await?;
+    }
 
     let delivery = sqlx::query_as::<_, Delivery>(
         r#"
@@ -234,7 +239,7 @@ async fn update_status(
             END,
             notes = COALESCE($3, notes),
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND status = $4
         RETURNING id, route_id, drone_id, cargo, status, scheduled_at, started_at,
                   completed_at, notes, created_at, updated_at
         "#,
@@ -242,8 +247,10 @@ async fn update_status(
     .bind(id)
     .bind(&body.status)
     .bind(body.notes.as_deref())
-    .fetch_one(&state.pool)
-    .await?;
+    .bind(&current.status)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(|| AppError::Conflict("delivery status changed; reload and retry".into()))?;
 
     Ok(Json(delivery))
 }

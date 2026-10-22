@@ -72,11 +72,11 @@ pub async fn bootstrap_admin(pool: &PgPool, username: &str, password: &str) -> a
     .await?;
 
     if let Some((user_id, password_hash)) = existing {
-        if verify_password(password, &password_hash) {
+        if verify_password_async(password.to_owned(), password_hash).await? {
             return Ok(());
         }
 
-        let next_hash = hash_password(password)?;
+        let next_hash = hash_password_async(password.to_owned()).await?;
         let mut tx = pool.begin().await?;
         sqlx::query(
             "UPDATE neurovector.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1",
@@ -95,7 +95,7 @@ pub async fn bootstrap_admin(pool: &PgPool, username: &str, password: &str) -> a
             "admin password updated; existing sessions revoked"
         );
     } else {
-        let password_hash = hash_password(password)?;
+        let password_hash = hash_password_async(password.to_owned()).await?;
         sqlx::query(
             "INSERT INTO neurovector.admin_users (username, password_hash) VALUES ($1, $2)",
         )
@@ -148,7 +148,7 @@ pub(crate) async fn login(
         ));
     };
 
-    if !verify_password(&body.password, &credential.password_hash) {
+    if !verify_password_async(body.password.clone(), credential.password_hash.clone()).await? {
         tracing::warn!(username, "admin login failed");
         return Err(AppError::Unauthorized(
             "아이디 또는 비밀번호가 올바르지 않습니다.".into(),
@@ -292,6 +292,28 @@ async fn create_session(
     tx.commit().await?;
 
     Ok((token, expires_at))
+}
+
+// Argon2 is CPU/memory intensive. Bound concurrent work and hold the permit
+// inside the blocking task so request cancellation cannot start unbounded work.
+static PASSWORD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+async fn hash_password_async(password: String) -> anyhow::Result<String> {
+    let permit = PASSWORD_WORKERS.acquire().await?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        hash_password(&password)
+    })
+    .await?
+}
+
+async fn verify_password_async(password: String, hash: String) -> anyhow::Result<bool> {
+    let permit = PASSWORD_WORKERS.acquire().await?;
+    Ok(tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        verify_password(&password, &hash)
+    })
+    .await?)
 }
 
 fn hash_password(password: &str) -> anyhow::Result<String> {

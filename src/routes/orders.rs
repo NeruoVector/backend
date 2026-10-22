@@ -295,23 +295,35 @@ pub(crate) async fn create_order_in_tx(
         }
     }
 
+    let item_ids: Vec<Uuid> = body.items.iter().map(|item| item.item_id).collect();
+    // Every order acquires inventory locks in the same order, regardless of input order.
+    let stock_items = sqlx::query_as::<_, StockItem>(
+        r#"
+        SELECT id, name, unit_price, currency, stock_quantity, active
+        FROM neurovector.inventory_items
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id
+        FOR UPDATE
+        "#,
+    )
+    .bind(&item_ids)
+    .fetch_all(&mut **tx)
+    .await?;
+    let stock_by_id: HashMap<Uuid, StockItem> = stock_items
+        .into_iter()
+        .map(|item| (item.id, item))
+        .collect();
     let mut total_amount = 0i64;
     let mut currency: Option<String> = None;
-    let mut line_items = Vec::with_capacity(body.items.len());
+    let mut quantities = Vec::with_capacity(body.items.len());
+    let mut unit_prices = Vec::with_capacity(body.items.len());
+    let mut line_totals = Vec::with_capacity(body.items.len());
 
+    // Validate in request order so errors and the returned item order stay consistent.
     for requested in &body.items {
-        let item = sqlx::query_as::<_, StockItem>(
-            r#"
-            SELECT id, name, unit_price, currency, stock_quantity, active
-            FROM neurovector.inventory_items
-            WHERE id = $1
-            FOR UPDATE
-            "#,
-        )
-        .bind(requested.item_id)
-        .fetch_optional(&mut **tx)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("order item does not exist".into()))?;
+        let item = stock_by_id
+            .get(&requested.item_id)
+            .ok_or_else(|| AppError::BadRequest("order item does not exist".into()))?;
 
         if !item.active {
             return Err(AppError::Conflict(format!(
@@ -342,20 +354,24 @@ pub(crate) async fn create_order_in_tx(
             .checked_add(line_total)
             .ok_or_else(|| AppError::BadRequest("order amount is too large".into()))?;
 
-        sqlx::query(
-            r#"
-            UPDATE neurovector.inventory_items
-            SET stock_quantity = stock_quantity - $2, updated_at = now()
-            WHERE id = $1
-            "#,
-        )
-        .bind(item.id)
-        .bind(requested.quantity)
-        .execute(&mut **tx)
-        .await?;
-
-        line_items.push((item.id, requested.quantity, item.unit_price, line_total));
+        quantities.push(requested.quantity);
+        unit_prices.push(item.unit_price);
+        line_totals.push(line_total);
     }
+
+    // All quantities and amounts have been checked while holding the inventory locks.
+    sqlx::query(
+        r#"
+        UPDATE neurovector.inventory_items AS inventory
+        SET stock_quantity = inventory.stock_quantity - requested.quantity, updated_at = now()
+        FROM UNNEST($1::uuid[], $2::int[]) AS requested(item_id, quantity)
+        WHERE inventory.id = requested.item_id
+        "#,
+    )
+    .bind(&item_ids)
+    .bind(&quantities)
+    .execute(&mut **tx)
+    .await?;
 
     let currency = currency.unwrap_or_else(|| "KRW".to_string());
     let order_number = format!(
@@ -389,25 +405,36 @@ pub(crate) async fn create_order_in_tx(
     .fetch_one(&mut **tx)
     .await?;
 
-    let mut items = Vec::with_capacity(line_items.len());
-    for (item_id, quantity, unit_price, line_total) in line_items {
-        let item = sqlx::query_as::<_, OrderItem>(
-            r#"
-            INSERT INTO neurovector.order_items
-                (order_id, item_id, quantity, unit_price, line_total)
-            VALUES ($1, $2, $3, $4, $5)
-            RETURNING id, order_id, item_id, quantity, unit_price, line_total, created_at
-            "#,
-        )
-        .bind(order.id)
-        .bind(item_id)
-        .bind(quantity)
-        .bind(unit_price)
-        .bind(line_total)
-        .fetch_one(&mut **tx)
-        .await?;
-        items.push(item);
-    }
+    let inserted_items = sqlx::query_as::<_, OrderItem>(
+        r#"
+        INSERT INTO neurovector.order_items
+            (order_id, item_id, quantity, unit_price, line_total)
+        SELECT $1, requested.item_id, requested.quantity, requested.unit_price, requested.line_total
+        FROM UNNEST($2::uuid[], $3::int[], $4::int8[], $5::int8[])
+            AS requested(item_id, quantity, unit_price, line_total)
+        RETURNING id, order_id, item_id, quantity, unit_price, line_total, created_at
+        "#,
+    )
+    .bind(order.id)
+    .bind(&item_ids)
+    .bind(&quantities)
+    .bind(&unit_prices)
+    .bind(&line_totals)
+    .fetch_all(&mut **tx)
+    .await?;
+    // INSERT RETURNING does not guarantee row order. Input item IDs are unique after validation.
+    let mut inserted_by_id: HashMap<Uuid, OrderItem> = inserted_items
+        .into_iter()
+        .map(|item| (item.item_id, item))
+        .collect();
+    let items = item_ids
+        .iter()
+        .map(|item_id| {
+            inserted_by_id
+                .remove(item_id)
+                .ok_or(AppError::Database(sqlx::Error::RowNotFound))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(OrderDetail {
         order,
@@ -494,14 +521,15 @@ pub(crate) async fn get_order_job(
 }
 
 pub(crate) async fn invalidate_order_cache(state: &AppState) {
-    if let Err(err) = state.cache.delete_prefix("orders:").await {
-        tracing::warn!(error = %err, "failed to invalidate order cache");
+    // Order creation/cancellation/refunds also change inventory. Scan once for
+    // all affected namespaces rather than traversing the Redis keyspace three times.
+    if let Err(err) = state
+        .cache
+        .delete_prefixes(&["orders:", "admin:orders:", "inventory:"])
+        .await
+    {
+        tracing::warn!(error = %err, "failed to invalidate order and inventory caches");
     }
-    if let Err(err) = state.cache.delete_prefix("admin:orders:").await {
-        tracing::warn!(error = %err, "failed to invalidate admin order cache");
-    }
-    // 주문 생성/취소/환불은 재고 수량을 바꾸므로 재고 캐시도 함께 무효화한다.
-    crate::routes::inventory::invalidate_inventory_cache(state).await;
 }
 
 #[utoipa::path(
@@ -910,12 +938,14 @@ async fn restore_stock(tx: &mut Transaction<'_, Postgres>, order_id: Uuid) -> Re
         SELECT id, order_id, item_id, quantity, unit_price, line_total, created_at
         FROM neurovector.order_items
         WHERE order_id = $1
+        ORDER BY item_id
         "#,
     )
     .bind(order_id)
     .fetch_all(&mut **tx)
     .await?;
 
+    // Match order creation's inventory lock order during cancellation and refund.
     for item in items {
         sqlx::query(
             "UPDATE neurovector.inventory_items SET stock_quantity = stock_quantity + $2, updated_at = now() WHERE id = $1",

@@ -6,7 +6,7 @@ NeuroVector API 서버입니다.
 - PostgreSQL(pgvector) · Redis · Kafka 연동
 - Mosquitto MQTT 수신 (감지/텔레메트리/상태)
 - MediaMTX 연동 (SRT 영상 수신, WebRTC/WHEP 중계, 녹화 조회)
-- 경로 검증 · 배송 일정 · 장기 위험 예측 · 비행 분석
+- 경로 계획·드론 교차 검증·창문 바깥 수령 · 배송 일정 · 장기 위험 예측 · 비행 분석
 - 재고 · 주문 · 더미 결제
 - Kafka 기반 비동기 주문 큐 · 주문/결제 이벤트 관리
 - Redis cache-aside (주문/재고/관리자 조회)
@@ -62,6 +62,9 @@ API 문서는 Swagger UI 에서 확인할 수 있습니다.
 | `GET` | `/api/v1/routes` | 경로 목록 |
 | `POST` | `/api/v1/routes` | 경로 생성 (검증 통과 시) |
 | `POST` | `/api/v1/routes/validate` | 경로 검증만 수행 |
+| `POST` | `/api/v1/routes/plan` | 우회 후보 계획·창문 바깥 정지 경로 생성 |
+| `GET` | `/api/v1/routes/plans/{id}` | 드론 전달용 계획 조회 |
+| `POST` | `/api/v1/routes/plans/{id}/cross-check` | 드론 독립 검증 결과 비교 |
 | `GET` | `/api/v1/routes/{id}` | 경로 조회 |
 | `GET` | `/api/v1/routes/{id}/validation` | 저장된 경로 재검증 |
 | `DELETE` | `/api/v1/routes/{id}` | 경로 삭제 |
@@ -227,6 +230,8 @@ psql "$DATABASE_URL" -f migrations/0002_routes_deliveries_flights_orders.sql
 psql "$DATABASE_URL" -f migrations/0003_order_queue_cache.sql
 psql "$DATABASE_URL" -f migrations/0004_admin_auth.sql
 psql "$DATABASE_URL" -f migrations/0005_detection_distance.sql
+psql "$DATABASE_URL" -f migrations/0006_detection_priority.sql
+psql "$DATABASE_URL" -f migrations/0007_mission_plans.sql
 ```
 
 `platform` compose 에서는 `migrate` 서비스가 모든 마이그레이션을 순서대로 적용합니다.
@@ -265,3 +270,13 @@ cargo test
 cargo clippy --all-targets
 cargo fmt
 ```
+
+## 이번 최적화 및 경로 연동
+
+[최적화 설명](docs/optimization.md)에 주문 SQL 배치, Redis 연결 재사용·전체 작업 시간 제한,
+캐시 무효화, 비밀번호 계산 분리의 변경과 범위를 기록했습니다.
+
+[임무 계획 연동](docs/missions.md)에 창문 좌표·외부 접근·정지 지점, 후보 경로 선택,
+드론 검증기 실행과 교차 검증 API 사용법이 있습니다. 배송을 `dispatched`/`in_flight`로
+바꾸려면 해당 경로의 유효한 드론 검증이 필요합니다. 기존 경로만 있는 배송은 먼저 새 임무
+계획을 생성하고 그 `route_id`로 예약해야 합니다. 마이그레이션은 배포 시 별도로 적용하세요.

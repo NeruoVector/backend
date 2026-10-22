@@ -1,5 +1,6 @@
+use crate::redis_store::RedisStore;
 use axum::http::{HeaderMap, HeaderValue};
-use redis::{AsyncCommands, Client};
+use redis::AsyncCommands;
 use serde::{Serialize, de::DeserializeOwned};
 use utoipa::ToSchema;
 
@@ -8,7 +9,7 @@ use utoipa::ToSchema;
 /// Redis 장애가 API 장애로 이어지지 않도록 모든 캐시 작업은 best-effort 로 동작한다.
 #[derive(Clone)]
 pub struct Cache {
-    client: Client,
+    client: RedisStore,
     enabled: bool,
     ttl_seconds: u64,
     namespace: String,
@@ -23,7 +24,7 @@ pub struct CacheInfo {
 }
 
 impl Cache {
-    pub fn new(client: Client, enabled: bool, ttl_seconds: u64) -> Self {
+    pub fn new(client: RedisStore, enabled: bool, ttl_seconds: u64) -> Self {
         Self {
             client,
             enabled,
@@ -37,8 +38,11 @@ impl Cache {
             return None;
         }
 
-        let mut conn = self.client.get_multiplexed_async_connection().await.ok()?;
-        let raw: Option<String> = conn.get(self.key(key)).await.ok()?;
+        let raw: Option<String> = self
+            .client
+            .execute(|mut conn| async move { conn.get(self.key(key)).await })
+            .await
+            .ok()?;
         match raw {
             Some(raw) => serde_json::from_str(&raw).ok(),
             None => None,
@@ -61,44 +65,66 @@ impl Cache {
 
         let payload = serde_json::to_string(value)?;
         let ttl = ttl_seconds.unwrap_or(self.ttl_seconds).max(1);
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let _: () = conn.set_ex(self.key(key), payload, ttl).await?;
+        self.client
+            .execute(|mut conn| async move {
+                conn.set_ex::<_, _, ()>(self.key(key), payload, ttl).await
+            })
+            .await?;
         Ok(())
     }
 
-    /// prefix 로 시작하는 캐시 키를 SCAN 으로 지운다. `KEYS *` 를 사용하지 않는다.
+    /// Invalidate related namespaces in one scan; UNLINK frees values off the
+    /// Redis command thread. Prefixes are internal application constants.
     pub async fn delete_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
-        if !self.enabled {
+        self.delete_prefixes(&[prefix]).await
+    }
+
+    pub async fn delete_prefixes(&self, prefixes: &[&str]) -> anyhow::Result<u64> {
+        if !self.enabled || prefixes.is_empty() {
             return Ok(0);
         }
-
-        let pattern = format!("{}*", self.key(prefix));
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let mut cursor = 0u64;
-        let mut deleted = 0u64;
-
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(200)
-                .query_async(&mut conn)
-                .await?;
-
-            if !keys.is_empty() {
-                let count: u64 = conn.del(keys).await?;
-                deleted += count;
-            }
-
-            cursor = next_cursor;
-            if cursor == 0 {
-                break;
-            }
-        }
-
-        Ok(deleted)
+        let prefixes = prefixes
+            .iter()
+            .map(|prefix| self.key(prefix))
+            .collect::<Vec<_>>();
+        let pattern = if prefixes.len() == 1 {
+            format!("{}*", prefixes[0])
+        } else {
+            format!("{}*", self.namespace)
+        };
+        self.client
+            .execute(|mut conn| async move {
+                let mut cursor = 0u64;
+                let mut deleted = 0u64;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(200)
+                        .query_async(&mut conn)
+                        .await?;
+                    let keys = keys
+                        .into_iter()
+                        .filter(|key| prefixes.iter().any(|prefix| key.starts_with(prefix)))
+                        .collect::<Vec<_>>();
+                    if !keys.is_empty() {
+                        let count: u64 = redis::cmd("UNLINK")
+                            .arg(keys)
+                            .query_async(&mut conn)
+                            .await?;
+                        deleted += count;
+                    }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
+                Ok(deleted)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn info(&self) -> CacheInfo {
@@ -118,28 +144,32 @@ impl Cache {
 
     async fn count_prefix(&self, prefix: &str) -> anyhow::Result<u64> {
         let pattern = format!("{}*", self.key(prefix));
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
-        let mut cursor = 0u64;
-        let mut count = 0u64;
+        self.client
+            .execute(|mut conn| async move {
+                let mut cursor = 0u64;
+                let mut count = 0u64;
 
-        loop {
-            let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
-                .arg(cursor)
-                .arg("MATCH")
-                .arg(&pattern)
-                .arg("COUNT")
-                .arg(500)
-                .query_async(&mut conn)
-                .await?;
-            count += keys.len() as u64;
+                loop {
+                    let (next_cursor, keys): (u64, Vec<String>) = redis::cmd("SCAN")
+                        .arg(cursor)
+                        .arg("MATCH")
+                        .arg(&pattern)
+                        .arg("COUNT")
+                        .arg(500)
+                        .query_async(&mut conn)
+                        .await?;
+                    count += keys.len() as u64;
 
-            cursor = next_cursor;
-            if cursor == 0 {
-                break;
-            }
-        }
+                    cursor = next_cursor;
+                    if cursor == 0 {
+                        break;
+                    }
+                }
 
-        Ok(count)
+                Ok(count)
+            })
+            .await
+            .map_err(Into::into)
     }
 
     /// Redis TTL 연장 없이 키 존재 여부만 확인한다. 캐시 히트 헤더용.

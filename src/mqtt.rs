@@ -235,14 +235,15 @@ async fn handle_status(state: &AppState, drone_id: &str, payload: &[u8]) {
         "updated_at": Utc::now(),
     });
 
-    match state.redis.get_multiplexed_async_connection().await {
-        Ok(mut conn) => {
-            use redis::AsyncCommands;
-            let _: Result<(), _> = conn.set_ex(key, value.to_string(), ttl).await;
-        }
-        Err(err) => {
-            tracing::warn!(error = %err, drone_id, "failed to update drone online status");
-        }
+    use redis::AsyncCommands;
+    if let Err(err) = state
+        .redis
+        .execute(
+            |mut conn| async move { conn.set_ex::<_, _, ()>(key, value.to_string(), ttl).await },
+        )
+        .await
+    {
+        tracing::warn!(error = %err, drone_id, "failed to update drone online status");
     }
 }
 

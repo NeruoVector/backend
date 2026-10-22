@@ -604,37 +604,8 @@ async fn save_offset(pool: &PgPool, topic: &str, next_offset: i64) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache::Cache, events::KafkaPublisher, media::MediaClient};
+    use crate::state::test_state;
     use sqlx::postgres::PgPoolOptions;
-    use std::path::PathBuf;
-
-    fn test_state(pool: PgPool) -> AppState {
-        let redis = redis::Client::open("redis://127.0.0.1:6399/0").expect("redis url");
-        AppState {
-            pool,
-            redis: redis.clone(),
-            cache: Cache::new(redis, false, 30),
-            kafka: KafkaPublisher::new("127.0.0.1:19092", "neurovector.events"),
-            order_queue: KafkaPublisher::new("127.0.0.1:19092", "neurovector.orders"),
-            media: MediaClient::new(
-                "http://127.0.0.1:9997",
-                "http://127.0.0.1:8889",
-                "localhost",
-                8890,
-                PathBuf::from("/tmp"),
-            ),
-            admin_session_ttl_seconds: 86_400,
-            admin_cookie_secure: false,
-            max_altitude_m: 120.0,
-            route_max_leg_m: 5000.0,
-            route_max_distance_m: 20_000.0,
-            route_battery_wh: 500.0,
-            route_power_w: 300.0,
-            risk_lookback_days: 90,
-            risk_corridor_m: 150.0,
-            telemetry_online_ttl_seconds: 120,
-        }
-    }
 
     #[tokio::test]
     async fn processes_create_order_job_idempotently() {

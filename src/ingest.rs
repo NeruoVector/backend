@@ -293,7 +293,6 @@ async fn find_active_flight(
 }
 
 async fn cache_latest_status(state: &AppState, telemetry: &Telemetry) -> anyhow::Result<()> {
-    let mut conn = state.redis.get_multiplexed_async_connection().await?;
     let key = format!("neurovector:drone:{}:status", telemetry.drone_id);
     let payload = json!({
         "online": true,
@@ -301,12 +300,13 @@ async fn cache_latest_status(state: &AppState, telemetry: &Telemetry) -> anyhow:
         "updated_at": Utc::now(),
     });
 
-    let _: () = conn
-        .set_ex(
-            key,
-            serde_json::to_string(&payload)?,
-            state.telemetry_online_ttl_seconds,
-        )
+    let payload = serde_json::to_string(&payload)?;
+    state
+        .redis
+        .execute(|mut conn| async move {
+            conn.set_ex::<_, _, ()>(key, payload, state.telemetry_online_ttl_seconds)
+                .await
+        })
         .await?;
     Ok(())
 }
