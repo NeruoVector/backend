@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// 위도/경도/고도 기준의 경로 지점.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Waypoint {
     pub lat: f64,
     pub lon: f64,
@@ -21,17 +21,6 @@ pub fn haversine_m(a: Point, b: Point) -> f64 {
     let dlon = lon2 - lon1;
     let h = (dlat / 2.0).sin().powi(2) + lat1.cos() * lat2.cos() * (dlon / 2.0).sin().powi(2);
     2.0 * EARTH_RADIUS_M * h.sqrt().asin()
-}
-
-pub fn route_distance_m(points: &[Point]) -> f64 {
-    points
-        .windows(2)
-        .map(|pair| haversine_m(pair[0], pair[1]))
-        .sum()
-}
-
-pub fn waypoints_to_points(waypoints: &[Waypoint]) -> Vec<Point> {
-    waypoints.iter().map(|w| (w.lat, w.lon)).collect()
 }
 
 /// 경로 전체를 감싸는 bounding box. padding_m 만큼 여유를 둔다.

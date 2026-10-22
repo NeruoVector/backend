@@ -24,9 +24,11 @@ mod events;
 mod geo;
 mod ingest;
 mod media;
+mod mission;
 mod models;
 mod mqtt;
 mod order_queue;
+mod redis_store;
 mod routes;
 mod state;
 
@@ -55,7 +57,10 @@ async fn main() -> anyhow::Result<()> {
 
     auth::bootstrap_admin(&pool, &config.admin_username, &config.admin_password).await?;
 
-    let redis = redis::Client::open(config.redis_url.clone())?;
+    let redis = redis_store::RedisStore::new(
+        redis::Client::open(config.redis_url.clone())?,
+        std::time::Duration::from_millis(config.redis_timeout_ms),
+    );
 
     if let Err(err) = tokio::fs::create_dir_all(&config.media_recordings_dir).await {
         tracing::warn!(
@@ -189,25 +194,23 @@ pub(crate) struct ReadinessResponse {
 pub(crate) async fn health_ready(
     State(state): State<AppState>,
 ) -> (StatusCode, Json<ReadinessResponse>) {
-    let db_ok = db::ping(&state.pool).await.is_ok();
-
-    let redis_ok = {
-        use redis::AsyncCommands;
-        let mut conn = match state.redis.get_multiplexed_async_connection().await {
-            Ok(c) => c,
-            Err(_) => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    Json(ReadinessResponse {
-                        status: "degraded",
-                        postgres: if db_ok { "ok" } else { "down" },
-                        redis: "down",
-                    }),
-                );
-            }
-        };
-        conn.ping::<String>().await.is_ok()
-    };
+    let (db_ok, redis_ok) = tokio::join!(
+        async {
+            matches!(
+                tokio::time::timeout(std::time::Duration::from_secs(2), db::ping(&state.pool))
+                    .await,
+                Ok(Ok(_))
+            )
+        },
+        async {
+            use redis::AsyncCommands;
+            state
+                .redis
+                .execute(|mut conn| async move { conn.ping::<String>().await })
+                .await
+                .is_ok()
+        }
+    );
 
     let ok = db_ok && redis_ok;
     let body = ReadinessResponse {

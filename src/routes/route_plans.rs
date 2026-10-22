@@ -20,6 +20,9 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(list_routes).post(create_route))
         .route("/validate", post(validate_route_endpoint))
+        .route("/plan", post(crate::mission::create_plan))
+        .route("/plans/{id}", get(crate::mission::get_plan))
+        .route("/plans/{id}/cross-check", post(crate::mission::cross_check))
         .route("/{id}", get(get_route).delete(delete_route))
         .route("/{id}/validation", get(validate_saved_route))
         .route(
@@ -29,7 +32,7 @@ pub fn router() -> Router<AppState> {
         .route("/no-fly-zones/{id}", delete(delete_no_fly_zone))
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, utoipa::ToSchema, sqlx::FromRow)]
 pub struct Route {
     pub id: Uuid,
     pub name: String,
@@ -43,7 +46,7 @@ pub struct Route {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RouteInput {
     pub name: String,
     #[serde(default)]
@@ -55,7 +58,7 @@ pub struct RouteInput {
     pub max_altitude_m: Option<f64>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RouteValidation {
     pub valid: bool,
     pub errors: Vec<String>,
@@ -69,14 +72,14 @@ pub struct RouteValidation {
     pub no_fly_zone_conflicts: Vec<ZoneConflict>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ZoneConflict {
     pub zone_id: Uuid,
     pub zone_name: String,
     pub reason: String,
 }
 
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize, utoipa::ToSchema, sqlx::FromRow)]
 pub struct NoFlyZone {
     pub id: Uuid,
     pub name: String,
@@ -108,12 +111,12 @@ pub struct ListRoutesParams {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct NoFlyZoneRow {
-    id: Uuid,
-    name: String,
-    polygon: Value,
-    max_altitude_m: Option<f64>,
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema, sqlx::FromRow)]
+pub struct NoFlyZoneRow {
+    pub id: Uuid,
+    pub name: String,
+    pub polygon: Value,
+    pub max_altitude_m: Option<f64>,
 }
 
 async fn list_routes(
@@ -250,16 +253,16 @@ async fn create_no_fly_zone(
     if body.name.trim().is_empty() {
         return Err(AppError::BadRequest("name is required".into()));
     }
-    if body.polygon.len() < 3 {
+    if !(3..=256).contains(&body.polygon.len()) {
         return Err(AppError::BadRequest(
-            "polygon must have at least 3 points".into(),
+            "polygon must have 3 to 256 points".into(),
         ));
     }
     for point in &body.polygon {
         validate_lat_lon(point.lat, point.lon).map_err(AppError::BadRequest)?;
     }
     if let Some(max_altitude_m) = body.max_altitude_m
-        && max_altitude_m <= 0.0
+        && (!max_altitude_m.is_finite() || max_altitude_m <= 0.0)
     {
         return Err(AppError::BadRequest(
             "max_altitude_m must be positive".into(),
@@ -301,174 +304,223 @@ async fn delete_no_fly_zone(
     Ok(StatusCode::NO_CONTENT)
 }
 
+pub async fn load_active_zones(pool: &PgPool) -> Result<Vec<NoFlyZoneRow>, AppError> {
+    Ok(sqlx::query_as::<_, NoFlyZoneRow>(
+        "SELECT id, name, polygon, max_altitude_m FROM neurovector.no_fly_zones WHERE active = true ORDER BY id",
+    ).fetch_all(pool).await?)
+}
+
 pub async fn validate_route(
     state: &AppState,
     input: &RouteInput,
 ) -> Result<RouteValidation, AppError> {
-    let mut errors = Vec::new();
-    let mut warnings = Vec::new();
+    let zones = load_active_zones(&state.pool).await?;
+    Ok(validate_route_with_zones(state, input, &zones, 0.0))
+}
 
-    if input.name.trim().is_empty() {
-        errors.push("name is required".to_string());
-    }
-    if input.waypoints.len() < 2 {
-        errors.push("at least 2 waypoints are required".to_string());
-    }
-
-    let cruise_speed_mps = input.cruise_speed_mps.unwrap_or(8.0);
-    if cruise_speed_mps <= 0.0 {
-        errors.push("cruise_speed_mps must be positive".to_string());
-    }
-    let max_altitude_m = input.max_altitude_m.unwrap_or(state.max_altitude_m);
-    if max_altitude_m <= 0.0 || max_altitude_m > state.max_altitude_m {
-        errors.push(format!(
-            "max_altitude_m must be between 0 and {}",
-            state.max_altitude_m
-        ));
-    }
-
-    let mut leg_lengths_m = Vec::new();
-    let mut previous: Option<&Waypoint> = None;
-    for (index, waypoint) in input.waypoints.iter().enumerate() {
-        if let Err(err) = validate_lat_lon(waypoint.lat, waypoint.lon) {
-            errors.push(format!("waypoint {index}: {err}"));
-        }
-        if waypoint.altitude_m <= 0.0 {
-            errors.push(format!("waypoint {index}: altitude_m must be positive"));
-        }
-        if waypoint.altitude_m > max_altitude_m {
-            errors.push(format!(
-                "waypoint {index}: altitude_m {} exceeds limit {max_altitude_m}",
-                waypoint.altitude_m
-            ));
-        }
-        if let Some(previous) = previous {
-            let leg = geo::haversine_m((previous.lat, previous.lon), (waypoint.lat, waypoint.lon));
-            if leg < 1.0 {
-                warnings.push(format!(
-                    "waypoint {index}: distance from previous point is < 1m"
-                ));
-            }
-            if leg > state.route_max_leg_m {
-                errors.push(format!(
-                    "waypoint {index}: leg {leg:.0}m exceeds maximum {}m",
-                    state.route_max_leg_m
-                ));
-            }
-            leg_lengths_m.push(leg);
-        }
-        previous = Some(waypoint);
-    }
-
-    let points = geo::waypoints_to_points(&input.waypoints);
-    let distance_m = geo::route_distance_m(&points);
-    if distance_m > state.route_max_distance_m {
-        errors.push(format!(
-            "route distance {distance_m:.0}m exceeds maximum {}m",
-            state.route_max_distance_m
-        ));
-    }
-    let estimated_duration_s = if cruise_speed_mps > 0.0 {
-        distance_m / cruise_speed_mps
-    } else {
-        0.0
+pub fn validate_route_with_zones(
+    state: &AppState,
+    input: &RouteInput,
+    zones: &[NoFlyZoneRow],
+    hold_seconds: f64,
+) -> RouteValidation {
+    let mut result = RouteValidation {
+        valid: false,
+        errors: Vec::new(),
+        warnings: Vec::new(),
+        waypoint_count: input.waypoints.len(),
+        distance_m: 0.0,
+        estimated_duration_s: 0.0,
+        estimated_energy_wh: 0.0,
+        max_altitude_m: input.max_altitude_m.unwrap_or(state.max_altitude_m),
+        leg_lengths_m: Vec::new(),
+        no_fly_zone_conflicts: Vec::new(),
     };
-    let estimated_energy_wh = state.route_power_w * estimated_duration_s / 3600.0;
-    if estimated_energy_wh > state.route_battery_wh {
-        errors.push(format!(
-            "estimated energy {estimated_energy_wh:.1}Wh exceeds battery capacity {}Wh",
-            state.route_battery_wh
-        ));
-    } else if estimated_energy_wh > state.route_battery_wh * 0.8 {
-        warnings.push(format!(
-            "estimated energy {estimated_energy_wh:.1}Wh uses more than 80% of battery"
-        ));
+    let speed = input.cruise_speed_mps.unwrap_or(8.0);
+    if input.name.trim().is_empty() {
+        result.errors.push("name is required".into());
     }
-    if input
-        .waypoints
-        .iter()
-        .any(|w| w.altitude_m > state.max_altitude_m)
+    if !(2..=256).contains(&input.waypoints.len()) {
+        result
+            .errors
+            .push("route must have 2 to 256 waypoints".into());
+    }
+    if !speed.is_finite() || speed <= 0.0 || speed > 100.0 {
+        result
+            .errors
+            .push("cruise_speed_mps must be finite and in (0, 100]".into());
+    }
+    if !result.max_altitude_m.is_finite()
+        || result.max_altitude_m <= 0.0
+        || result.max_altitude_m > state.max_altitude_m
     {
-        // 개별 waypoint 검사에서 이미 오류를 추가했지만, 상한을 별도로 명시한다.
-        warnings.push(format!("legal altitude limit is {}m", state.max_altitude_m));
+        result
+            .errors
+            .push("max_altitude_m exceeds configured altitude limit".into());
     }
-
-    let zones = sqlx::query_as::<_, NoFlyZoneRow>(
-        r#"
-        SELECT id, name, polygon, max_altitude_m
-        FROM neurovector.no_fly_zones
-        WHERE active = true
-        "#,
-    )
-    .fetch_all(&state.pool)
-    .await?;
-
-    let samples = sample_route_with_altitude(&input.waypoints, 100.0);
-    let mut no_fly_zone_conflicts = Vec::new();
+    if !hold_seconds.is_finite() || !(0.0..=3600.0).contains(&hold_seconds) {
+        result
+            .errors
+            .push("hold_seconds must be finite and in [0, 3600]".into());
+    }
+    for (i, w) in input.waypoints.iter().enumerate() {
+        if let Err(e) = validate_lat_lon(w.lat, w.lon) {
+            result.errors.push(format!("waypoint {i}: {e}"));
+        }
+        if !w.altitude_m.is_finite() || w.altitude_m <= 0.0 || w.altitude_m > result.max_altitude_m
+        {
+            result
+                .errors
+                .push(format!("waypoint {i}: invalid or excessive altitude"));
+        }
+    }
+    // Reject malformed/oversized inputs before geometry or allocation proportional to route length.
+    if !result.errors.is_empty() {
+        return result;
+    }
+    for pair in input.waypoints.windows(2) {
+        if (pair[0].lon - pair[1].lon).abs() > 180.0 {
+            result
+                .errors
+                .push("antimeridian-crossing legs are unsupported".into());
+        }
+        let leg = geo::haversine_m((pair[0].lat, pair[0].lon), (pair[1].lat, pair[1].lon))
+            .hypot(pair[1].altitude_m - pair[0].altitude_m);
+        if !leg.is_finite() {
+            result
+                .errors
+                .push("leg distance cannot be calculated".into());
+            result.leg_lengths_m.push(0.0);
+            continue;
+        }
+        if leg > state.route_max_leg_m {
+            result.errors.push("leg exceeds maximum distance".into());
+        }
+        result.leg_lengths_m.push(leg);
+    }
+    result.distance_m = result.leg_lengths_m.iter().sum();
+    result.estimated_duration_s = result.distance_m / speed + hold_seconds;
+    result.estimated_energy_wh = state.route_power_w * result.estimated_duration_s / 3600.0;
+    if result.distance_m > state.route_max_distance_m {
+        result.errors.push("route exceeds maximum distance".into());
+    }
+    if result.estimated_energy_wh > state.route_battery_wh {
+        result.errors.push("route exceeds battery capacity".into());
+    }
+    if result.estimated_energy_wh > state.route_battery_wh * 0.8 {
+        result
+            .warnings
+            .push("route uses more than 80% of battery".into());
+    }
     for zone in zones {
-        let polygon = match serde_json::from_value::<Vec<Waypoint>>(zone.polygon) {
-            Ok(polygon) => polygon,
-            Err(err) => {
-                warnings.push(format!("zone {} has invalid polygon: {err}", zone.name));
+        let polygon = serde_json::from_value::<Vec<Waypoint>>(zone.polygon.clone());
+        let polygon = match polygon {
+            Ok(p)
+                if (3..=256).contains(&p.len())
+                    && p.iter().all(|w| validate_lat_lon(w.lat, w.lon).is_ok())
+                    && zone.max_altitude_m.is_none_or(|v| v.is_finite() && v > 0.0)
+                    && p.iter()
+                        .zip(p.iter().cycle().skip(1))
+                        .all(|(a, b)| (a.lon - b.lon).abs() <= 180.0) =>
+            {
+                p
+            }
+            _ => {
+                result
+                    .errors
+                    .push(format!("invalid active no-fly zone {}", zone.id));
                 continue;
             }
         };
-
-        let conflict = samples.iter().find(|sample| {
-            let inside = geo::point_in_polygon(sample.lat, sample.lon, &polygon);
-            let below_zone_ceiling = zone
-                .max_altitude_m
-                .is_none_or(|ceiling| sample.altitude_m <= ceiling);
-            inside && below_zone_ceiling
-        });
-
-        if conflict.is_some() {
-            errors.push(format!("route crosses no-fly zone '{}'", zone.name));
-            no_fly_zone_conflicts.push(ZoneConflict {
+        if input
+            .waypoints
+            .windows(2)
+            .any(|pair| segment_hits_zone(&pair[0], &pair[1], &polygon, zone.max_altitude_m))
+        {
+            result
+                .errors
+                .push(format!("route crosses no-fly zone '{}'", zone.name));
+            result.no_fly_zone_conflicts.push(ZoneConflict {
                 zone_id: zone.id,
-                zone_name: zone.name,
-                reason: "route intersects the zone below its altitude ceiling".to_string(),
+                zone_name: zone.name.clone(),
+                reason: "segment touches/intersects restricted zone below ceiling".into(),
             });
         }
     }
-
-    Ok(RouteValidation {
-        valid: errors.is_empty(),
-        errors,
-        warnings,
-        waypoint_count: input.waypoints.len(),
-        distance_m,
-        estimated_duration_s,
-        estimated_energy_wh,
-        max_altitude_m,
-        leg_lengths_m,
-        no_fly_zone_conflicts,
-    })
+    result.valid = result.errors.is_empty();
+    result
 }
 
-fn sample_route_with_altitude(waypoints: &[Waypoint], max_step_m: f64) -> Vec<Waypoint> {
-    if waypoints.len() < 2 {
-        return waypoints.to_vec();
-    }
-
-    let mut samples = Vec::new();
-    for pair in waypoints.windows(2) {
-        let (start, end) = (&pair[0], &pair[1]);
-        let distance = geo::haversine_m((start.lat, start.lon), (end.lat, end.lon));
-        let steps = ((distance / max_step_m).ceil() as usize).max(1);
-        for step in 0..steps {
-            let t = step as f64 / steps as f64;
-            samples.push(Waypoint {
-                lat: start.lat + (end.lat - start.lat) * t,
-                lon: start.lon + (end.lon - start.lon) * t,
-                altitude_m: start.altitude_m + (end.altitude_m - start.altitude_m) * t,
-            });
+fn cross(a: (f64, f64), b: (f64, f64)) -> f64 {
+    a.0 * b.1 - a.1 * b.0
+}
+fn point_on_segment(p: &Waypoint, a: &Waypoint, b: &Waypoint) -> bool {
+    let d = (b.lon - a.lon, b.lat - a.lat);
+    let q = (p.lon - a.lon, p.lat - a.lat);
+    cross(d, q).abs() <= 1e-12
+        && p.lon >= a.lon.min(b.lon) - 1e-12
+        && p.lon <= a.lon.max(b.lon) + 1e-12
+        && p.lat >= a.lat.min(b.lat) - 1e-12
+        && p.lat <= a.lat.max(b.lat) + 1e-12
+}
+fn inside_or_boundary(p: &Waypoint, polygon: &[Waypoint]) -> bool {
+    geo::point_in_polygon(p.lat, p.lon, polygon)
+        || polygon
+            .iter()
+            .zip(polygon.iter().cycle().skip(1))
+            .any(|(a, b)| point_on_segment(p, a, b))
+}
+/// Clip to the below-ceiling interval, then intersect every polygon edge exactly.
+pub fn segment_hits_zone(
+    a: &Waypoint,
+    b: &Waypoint,
+    polygon: &[Waypoint],
+    ceiling: Option<f64>,
+) -> bool {
+    let (mut lo, mut hi) = (0.0_f64, 1.0_f64);
+    if let Some(c) = ceiling {
+        if a.altitude_m > c && b.altitude_m > c {
+            return false;
+        }
+        let dz = b.altitude_m - a.altitude_m;
+        if dz > 0.0 {
+            hi = hi.min((c - a.altitude_m) / dz);
+        }
+        if dz < 0.0 {
+            lo = lo.max((c - a.altitude_m) / dz);
+        }
+        if lo > hi {
+            return false;
         }
     }
-    if let Some(last) = waypoints.last() {
-        samples.push(last.clone());
+    let at = |t: f64| Waypoint {
+        lat: a.lat + (b.lat - a.lat) * t,
+        lon: a.lon + (b.lon - a.lon) * t,
+        altitude_m: a.altitude_m + (b.altitude_m - a.altitude_m) * t,
+    };
+    let p = at(lo);
+    let q = at(hi);
+    if inside_or_boundary(&p, polygon) || inside_or_boundary(&q, polygon) {
+        return true;
     }
-    samples
+    let r = (q.lon - p.lon, q.lat - p.lat);
+    polygon
+        .iter()
+        .zip(polygon.iter().cycle().skip(1))
+        .any(|(c, d)| {
+            let s = (d.lon - c.lon, d.lat - c.lat);
+            let delta = (c.lon - p.lon, c.lat - p.lat);
+            let den = cross(r, s);
+            if den.abs() <= 1e-12 {
+                return point_on_segment(c, &p, &q)
+                    || point_on_segment(d, &p, &q)
+                    || point_on_segment(&p, c, d)
+                    || point_on_segment(&q, c, d);
+            }
+            let t = cross(delta, s) / den;
+            let u = cross(delta, r) / den;
+            (-1e-12..=1.0 + 1e-12).contains(&t) && (-1e-12..=1.0 + 1e-12).contains(&u)
+        })
 }
 
 pub fn validate_lat_lon(lat: f64, lon: f64) -> Result<(), String> {
