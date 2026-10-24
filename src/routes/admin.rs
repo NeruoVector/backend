@@ -156,6 +156,7 @@ pub(crate) async fn admin_list_orders(
         offset
     );
 
+    let key = state.cache.entry(&key).await;
     if let Some(cached) = state.cache.get::<AdminOrderList>(&key).await {
         return Ok((Cache::headers(true), Json(cached)));
     }
@@ -238,7 +239,8 @@ pub(crate) async fn admin_order_stats(
     State(state): State<AppState>,
 ) -> Result<Json<AdminOrderStats>, AppError> {
     let key = "admin:orders:stats";
-    if let Some(cached) = state.cache.get::<AdminOrderStats>(key).await {
+    let key = state.cache.entry(key).await;
+    if let Some(cached) = state.cache.get::<AdminOrderStats>(&key).await {
         return Ok(Json(cached));
     }
 
@@ -265,7 +267,7 @@ pub(crate) async fn admin_order_stats(
     .fetch_one(&state.pool)
     .await?;
 
-    if let Err(err) = state.cache.set(key, &stats).await {
+    if let Err(err) = state.cache.set(&key, &stats).await {
         tracing::warn!(error = %err, "failed to cache admin order stats");
     }
 

@@ -10,7 +10,7 @@ use rskafka::client::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, Postgres, Transaction};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -23,6 +23,10 @@ use crate::{
 
 const WORKER_NAME: &str = "order-worker";
 const STALE_JOB_MINUTES: i64 = 10;
+
+#[cfg(test)]
+#[path = "order_queue_regression_tests.rs"]
+mod regression_tests;
 
 /// Kafka 주문 토픽에 실리는 메시지.
 ///
@@ -123,7 +127,7 @@ async fn publish_create_job(state: &AppState, job_id: Uuid) -> bool {
     {
         Ok(Ok(())) => {
             if let Err(err) = sqlx::query(
-                "UPDATE neurovector.order_jobs SET updated_at = now() WHERE id = $1 AND status = 'queued'",
+                "UPDATE neurovector.order_jobs SET updated_at = now() WHERE id = $1 AND status IN ('queued', 'failed')",
             )
             .bind(job_id)
             .execute(&state.pool)
@@ -144,21 +148,17 @@ async fn publish_create_job(state: &AppState, job_id: Uuid) -> bool {
     }
 }
 
-/// 주문/결제 상태 이벤트를 order_events 에 적재하고 Kafka 로도 발행한다.
-///
-/// Kafka 장애가 주문 API 를 실패시키지 않도록 best-effort 로 처리하되, 로컬 감사
-/// 로그는 먼저 남겨서 관리 화면에서 이벤트를 확인할 수 있게 한다. 컨슈머는 같은
-/// event_id 를 ON CONFLICT 로 무시하므로 재처리에도 안전하다.
-pub async fn publish_order_event(
-    state: &AppState,
+/// Persist the outbox event in the transaction that changes the order.
+pub async fn record_order_event(
+    tx: &mut Transaction<'_, Postgres>,
     event_type: &str,
     order_id: Uuid,
     job_id: Option<Uuid>,
     payload: Value,
-) {
+) -> Result<(), sqlx::Error> {
     let event_id = Uuid::new_v4();
 
-    if let Err(err) = sqlx::query(
+    sqlx::query(
         r#"
         INSERT INTO neurovector.order_events
             (event_id, event_type, order_id, job_id, payload)
@@ -171,40 +171,48 @@ pub async fn publish_order_event(
     .bind(order_id)
     .bind(job_id)
     .bind(&payload)
-    .execute(&state.pool)
-    .await
-    {
-        tracing::warn!(error = %err, %order_id, event_type, "failed to persist order event");
-    }
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
 
-    let message = OrderQueueMessage::OrderEvent {
-        event_id,
-        event_type: event_type.to_string(),
-        order_id,
-        job_id,
-        payload,
-    };
-    let event_type = event_type.to_string();
-    let publisher = state.order_queue.clone();
-
-    // Kafka 발행은 응답/컨슈머 처리 시간에 영향을 주지 않도록 백그라운드로 넘긴다.
-    // 감사 로그는 위에서 이미 PostgreSQL 에 기록했으므로 발행 실패가 주문을 실패시키지 않는다.
-    tokio::spawn(async move {
-        match tokio::time::timeout(
-            Duration::from_secs(1),
-            publisher.publish_json(Some(order_id.as_bytes()), &message),
+async fn publish_pending_events(state: &AppState) -> anyhow::Result<()> {
+    for _ in 0..50 {
+        let mut tx = state.pool.begin().await?;
+        let event = sqlx::query_as::<_, OrderEvent>(
+            "SELECT event_id, event_type, order_id, job_id, payload, created_at
+             FROM neurovector.order_events WHERE published_at IS NULL
+             ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED",
         )
-        .await
-        {
-            Ok(Ok(())) => {}
-            Ok(Err(err)) => {
-                tracing::warn!(error = %err, %order_id, event_type, "failed to publish order event");
-            }
-            Err(_) => {
-                tracing::warn!(%order_id, event_type, "timed out publishing order event");
-            }
-        }
-    });
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(event) = event else {
+            return Ok(());
+        };
+        let order_id = event
+            .order_id
+            .ok_or_else(|| anyhow::anyhow!("outbox event has no order_id"))?;
+        let message = OrderQueueMessage::OrderEvent {
+            event_id: event.event_id,
+            event_type: event.event_type,
+            order_id,
+            job_id: event.job_id,
+            payload: event.payload,
+        };
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            state
+                .order_queue
+                .publish_json(Some(order_id.as_bytes()), &message),
+        )
+        .await??;
+        sqlx::query("UPDATE neurovector.order_events SET published_at = now() WHERE event_id = $1")
+            .bind(event.event_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+    }
+    Ok(())
 }
 
 pub async fn get_job(pool: &PgPool, id: Uuid) -> Result<OrderJob, AppError> {
@@ -231,6 +239,7 @@ pub async fn retry_job(state: &AppState, id: Uuid) -> Result<EnqueueOrderRespons
             last_error = NULL,
             started_at = NULL,
             completed_at = NULL,
+            attempts = 0,
             updated_at = now()
         WHERE id = $1 AND status IN ('queued', 'failed', 'dead', 'cancelled')
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
@@ -277,15 +286,24 @@ pub fn spawn_worker(state: AppState, config: &Config) {
 
     let republisher_state = state.clone();
     tokio::spawn(async move {
-        if let Err(err) = recover_stale_jobs(&republisher_state.pool).await {
-            tracing::warn!(error = %err, "failed to recover stale order jobs");
-        }
-
         loop {
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            if let Err(err) = recover_stale_jobs(&republisher_state.pool).await {
+                tracing::warn!(error = %err, "failed to recover stale order jobs");
+            }
             if let Err(err) = republish_queued_jobs(&republisher_state).await {
                 tracing::warn!(error = %err, "failed to republish queued order jobs");
             }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+
+    let outbox_state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) = publish_pending_events(&outbox_state).await {
+                tracing::warn!(error = %err, "failed to publish order outbox; will retry");
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
@@ -306,7 +324,7 @@ async fn republish_queued_jobs(state: &AppState) -> anyhow::Result<()> {
         r#"
         SELECT id
         FROM neurovector.order_jobs
-        WHERE status = 'queued'
+        WHERE (status = 'queued' OR (status = 'failed' AND attempts < max_attempts))
           AND updated_at < now() - interval '30 seconds'
         ORDER BY created_at ASC
         LIMIT 50
@@ -415,8 +433,8 @@ async fn handle_message(state: &AppState, message: OrderQueueMessage) -> anyhow:
             sqlx::query(
                 r#"
                 INSERT INTO neurovector.order_events
-                    (event_id, event_type, order_id, job_id, payload)
-                VALUES ($1, $2, $3, $4, $5)
+                    (event_id, event_type, order_id, job_id, payload, published_at)
+                VALUES ($1, $2, $3, $4, $5, now())
                 ON CONFLICT (event_id) DO NOTHING
                 "#,
             )
@@ -441,22 +459,40 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
     let body: CreateOrder = match serde_json::from_value(job.payload.clone()) {
         Ok(body) => body,
         Err(err) => {
-            fail_job(&state.pool, job_id, format!("invalid job payload: {err}")).await?;
+            fail_job(
+                &state.pool,
+                job_id,
+                job.attempts,
+                format!("invalid job payload: {err}"),
+            )
+            .await?;
             return Ok(());
         }
     };
 
     if let Err(err) = orders::validate_create_order(&body) {
-        fail_job(&state.pool, job_id, err.to_string()).await?;
+        fail_job(&state.pool, job_id, job.attempts, err.to_string()).await?;
         return Ok(());
     }
 
     let mut tx = state.pool.begin().await?;
+    // Hold the job row while creating the order; recovery skips active transactions.
+    let owned = sqlx::query_scalar::<_, Uuid>(
+        "SELECT id FROM neurovector.order_jobs
+         WHERE id = $1 AND status = 'processing' AND attempts = $2 FOR UPDATE",
+    )
+    .bind(job_id)
+    .bind(job.attempts)
+    .fetch_optional(&mut *tx)
+    .await?;
+    if owned.is_none() {
+        return Ok(());
+    }
     let detail = match orders::create_order_in_tx(&mut tx, &body).await {
         Ok(detail) => detail,
         Err(err) => {
             tx.rollback().await.ok();
-            fail_job(&state.pool, job_id, err.to_string()).await?;
+            fail_job(&state.pool, job_id, job.attempts, err.to_string()).await?;
             return Ok(());
         }
     };
@@ -476,19 +512,12 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
     .await
     {
         tx.rollback().await.ok();
-        fail_job(&state.pool, job_id, err.to_string()).await?;
+        fail_job(&state.pool, job_id, job.attempts, err.to_string()).await?;
         return Ok(());
     }
 
-    if let Err(err) = tx.commit().await {
-        fail_job(&state.pool, job_id, err.to_string()).await?;
-        return Ok(());
-    }
-
-    orders::invalidate_order_cache(state).await;
-
-    publish_order_event(
-        state,
+    record_order_event(
+        &mut tx,
         "order.created",
         detail.order.id,
         Some(job_id),
@@ -500,7 +529,10 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
             "source": "kafka_queue",
         }),
     )
-    .await;
+    .await?;
+    // A failed commit can have an unknown outcome. Recovery checks the durable job state.
+    tx.commit().await?;
+    orders::invalidate_order_cache(state).await;
 
     tracing::info!(%job_id, order_id = %detail.order.id, "order job completed");
     Ok(())
@@ -512,10 +544,10 @@ async fn claim_job(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<OrderJob>> 
         UPDATE neurovector.order_jobs
         SET status = 'processing',
             attempts = attempts + 1,
-            started_at = COALESCE(started_at, now()),
+            started_at = now(),
             updated_at = now(),
             last_error = NULL
-        WHERE id = $1 AND status IN ('queued', 'failed')
+        WHERE id = $1 AND status IN ('queued', 'failed') AND attempts < max_attempts
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
                   created_at, updated_at, started_at, completed_at
         "#,
@@ -527,7 +559,7 @@ async fn claim_job(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<OrderJob>> 
     Ok(job)
 }
 
-async fn fail_job(pool: &PgPool, id: Uuid, error: String) -> anyhow::Result<()> {
+async fn fail_job(pool: &PgPool, id: Uuid, attempts: i32, error: String) -> anyhow::Result<()> {
     sqlx::query(
         r#"
         UPDATE neurovector.order_jobs
@@ -535,11 +567,12 @@ async fn fail_job(pool: &PgPool, id: Uuid, error: String) -> anyhow::Result<()> 
             last_error = $2,
             completed_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
             updated_at = now()
-        WHERE id = $1
+        WHERE id = $1 AND status = 'processing' AND attempts = $3
         "#,
     )
     .bind(id)
     .bind(error)
+    .bind(attempts)
     .execute(pool)
     .await?;
     Ok(())
@@ -549,11 +582,16 @@ async fn recover_stale_jobs(pool: &PgPool) -> anyhow::Result<()> {
     let result = sqlx::query(
         r#"
         UPDATE neurovector.order_jobs
-        SET status = 'failed',
-            last_error = 'worker stopped while processing; recovered on startup',
+        SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+            last_error = 'worker stopped while processing; recovered for retry',
+            completed_at = CASE WHEN attempts >= max_attempts THEN now() ELSE NULL END,
             updated_at = now()
-        WHERE status = 'processing'
-          AND started_at < now() - make_interval(mins => $1)
+        WHERE id IN (
+            SELECT id FROM neurovector.order_jobs
+            WHERE status = 'processing'
+              AND started_at < now() - make_interval(mins => $1)
+            FOR UPDATE SKIP LOCKED
+        )
         "#,
     )
     .bind(STALE_JOB_MINUTES as i32)

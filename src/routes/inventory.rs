@@ -109,6 +109,7 @@ pub(crate) async fn list_items(
         limit
     );
 
+    let key = state.cache.entry(&key).await;
     if let Some(cached) = state.cache.get::<Vec<InventoryItem>>(&key).await {
         return Ok((Cache::headers(true), Json(cached)));
     }
@@ -150,6 +151,7 @@ pub(crate) async fn get_item(
     Path(id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<InventoryItem>), AppError> {
     let key = format!("inventory:item:{id}");
+    let key = state.cache.entry(&key).await;
     if let Some(cached) = state.cache.get::<InventoryItem>(&key).await {
         return Ok((Cache::headers(true), Json(cached)));
     }

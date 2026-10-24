@@ -162,6 +162,7 @@ pub(crate) async fn list_orders(
         limit
     );
 
+    let key = state.cache.entry(&key).await;
     if let Some(cached) = state.cache.get::<Vec<Order>>(&key).await {
         return Ok((Cache::headers(true), Json(cached)));
     }
@@ -206,6 +207,7 @@ pub(crate) async fn get_order(
     Path(id): Path<Uuid>,
 ) -> Result<(HeaderMap, Json<OrderDetail>), AppError> {
     let key = format!("orders:detail:{id}");
+    let key = state.cache.entry(&key).await;
     if let Some(cached) = state.cache.get::<OrderDetail>(&key).await {
         return Ok((Cache::headers(true), Json(cached)));
     }
@@ -462,11 +464,8 @@ pub(crate) async fn create_order(
 
     let mut tx = state.pool.begin().await?;
     let detail = create_order_in_tx(&mut tx, &body).await?;
-    tx.commit().await?;
-
-    invalidate_order_cache(&state).await;
-    order_queue::publish_order_event(
-        &state,
+    order_queue::record_order_event(
+        &mut tx,
         "order.created",
         detail.order.id,
         None,
@@ -478,7 +477,9 @@ pub(crate) async fn create_order(
             "source": "sync_api",
         }),
     )
-    .await;
+    .await?;
+    tx.commit().await?;
+    invalidate_order_cache(&state).await;
 
     Ok((StatusCode::CREATED, Json(detail)))
 }
@@ -577,11 +578,8 @@ pub(crate) async fn update_order_status(
     .fetch_one(&mut *tx)
     .await?;
 
-    tx.commit().await?;
-
-    invalidate_order_cache(&state).await;
-    order_queue::publish_order_event(
-        &state,
+    order_queue::record_order_event(
+        &mut tx,
         "order.status_changed",
         order.id,
         None,
@@ -592,7 +590,9 @@ pub(crate) async fn update_order_status(
             "stock_restored": stock_restored,
         }),
     )
-    .await;
+    .await?;
+    tx.commit().await?;
+    invalidate_order_cache(&state).await;
 
     Ok(Json(order))
 }
@@ -710,16 +710,13 @@ pub(crate) async fn pay_order(
         .await?;
     }
 
-    tx.commit().await?;
-
-    invalidate_order_cache(&state).await;
     let event_type = if status == "captured" {
         "payment.captured"
     } else {
         "payment.failed"
     };
-    order_queue::publish_order_event(
-        &state,
+    order_queue::record_order_event(
+        &mut tx,
         event_type,
         payment.order_id,
         None,
@@ -732,7 +729,9 @@ pub(crate) async fn pay_order(
             "failure_reason": &payment.failure_reason,
         }),
     )
-    .await;
+    .await?;
+    tx.commit().await?;
+    invalidate_order_cache(&state).await;
 
     let code = if status == "captured" {
         StatusCode::CREATED
@@ -839,11 +838,8 @@ pub(crate) async fn refund_payment(
         .await?;
     }
 
-    tx.commit().await?;
-
-    invalidate_order_cache(&state).await;
-    order_queue::publish_order_event(
-        &state,
+    order_queue::record_order_event(
+        &mut tx,
         "payment.refunded",
         payment.order_id,
         None,
@@ -856,7 +852,9 @@ pub(crate) async fn refund_payment(
             "order_status": &order.status,
         }),
     )
-    .await;
+    .await?;
+    tx.commit().await?;
+    invalidate_order_cache(&state).await;
 
     Ok(Json(payment))
 }
