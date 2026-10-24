@@ -4,6 +4,10 @@ use redis::AsyncCommands;
 use serde::{Serialize, de::DeserializeOwned};
 use utoipa::ToSchema;
 
+#[cfg(test)]
+#[path = "cache_tests.rs"]
+mod tests;
+
 /// Redis cache-aside 래퍼.
 ///
 /// Redis 장애가 API 장애로 이어지지 않도록 모든 캐시 작업은 best-effort 로 동작한다.
@@ -23,6 +27,11 @@ pub struct CacheInfo {
     pub keys: u64,
 }
 
+pub struct CacheEntry {
+    key: String,
+    generation: Option<String>,
+}
+
 impl Cache {
     pub fn new(client: RedisStore, enabled: bool, ttl_seconds: u64) -> Self {
         Self {
@@ -33,14 +42,37 @@ impl Cache {
         }
     }
 
-    pub async fn get<T: DeserializeOwned>(&self, key: &str) -> Option<T> {
+    pub async fn entry(&self, key: &str) -> CacheEntry {
+        let generation = if self.enabled {
+            self.client
+                .execute(|mut conn| async move {
+                    redis::cmd("EVAL").arg(
+                        "redis.call('SET', KEYS[1], ARGV[1], 'NX'); return redis.call('GET', KEYS[1])",
+                    )
+                    .arg(1).arg("neurovector:cache-generation")
+                    .arg(uuid::Uuid::new_v4().to_string())
+                    .query_async::<String>(&mut conn)
+                    .await
+                })
+                .await
+                .ok()
+        } else {
+            None
+        };
+        CacheEntry {
+            key: self.key(key),
+            generation,
+        }
+    }
+
+    pub async fn get<T: DeserializeOwned>(&self, entry: &CacheEntry) -> Option<T> {
         if !self.enabled {
             return None;
         }
 
         let raw: Option<String> = self
             .client
-            .execute(|mut conn| async move { conn.get(self.key(key)).await })
+            .execute(|mut conn| async move { conn.get(&entry.key).await })
             .await
             .ok()?;
         match raw {
@@ -49,25 +81,41 @@ impl Cache {
         }
     }
 
-    pub async fn set<T: Serialize + ?Sized>(&self, key: &str, value: &T) -> anyhow::Result<()> {
-        self.set_with_ttl(key, value, None).await
+    pub async fn set<T: Serialize + ?Sized>(
+        &self,
+        entry: &CacheEntry,
+        value: &T,
+    ) -> anyhow::Result<()> {
+        self.set_with_ttl(entry, value, None).await
     }
 
     pub async fn set_with_ttl<T: Serialize + ?Sized>(
         &self,
-        key: &str,
+        entry: &CacheEntry,
         value: &T,
         ttl_seconds: Option<u64>,
     ) -> anyhow::Result<()> {
         if !self.enabled {
             return Ok(());
         }
+        let Some(generation) = &entry.generation else {
+            return Ok(());
+        };
 
         let payload = serde_json::to_string(value)?;
         let ttl = ttl_seconds.unwrap_or(self.ttl_seconds).max(1);
         self.client
             .execute(|mut conn| async move {
-                conn.set_ex::<_, _, ()>(self.key(key), payload, ttl).await
+                redis::cmd("EVAL").arg(
+                    "if redis.call('GET', KEYS[1]) == ARGV[1] then return redis.call('SET', KEYS[2], ARGV[2], 'EX', ARGV[3]) end",
+                )
+                .arg(2).arg("neurovector:cache-generation")
+                .arg(&entry.key)
+                .arg(generation)
+                .arg(payload)
+                .arg(ttl)
+                .query_async::<Option<String>>(&mut conn)
+                .await
             })
             .await?;
         Ok(())
@@ -94,6 +142,12 @@ impl Cache {
         };
         self.client
             .execute(|mut conn| async move {
+                // In-flight readers must not refill keys after invalidation.
+                conn.set::<_, _, ()>(
+                    "neurovector:cache-generation",
+                    uuid::Uuid::new_v4().to_string(),
+                )
+                .await?;
                 let mut cursor = 0u64;
                 let mut deleted = 0u64;
                 loop {

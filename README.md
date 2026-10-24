@@ -169,7 +169,15 @@ curl -b cookies.txt http://localhost:8081/api/v1/admin/orders/stats
 - 이벤트는 `event_id` 를 기본키로 사용해 재처리 시 중복 적재를 무시합니다.
 - Kafka 발행에 실패하면 job 은 `queued` 로 남고 응답의 `kafka_published=false` 로 표시됩니다.
   이후 republisher 가 주기적으로 재발행하며, 관리자 retry API 로 즉시 재시도할 수도 있습니다.
-- 주문/결제 상태 변경은 `order_events` 에 적재되고 같은 토픽으로 이벤트가 발행됩니다.
+- 5초마다 복구·재발행 대상을 확인합니다. `queued` 및 재시도 한도가 남은 `failed` 작업은
+  마지막 갱신 후 30초가 지나면 재발행합니다. `processing` 상태가 10분 넘게 남은 작업은
+  실행 중인 DB 트랜잭션의 잠금을 건너뛰고 복구합니다. 기본 시도 한도는 3회이며,
+  관리자 retry는 시도 횟수를 초기화합니다.
+- 주문 생성·상태 변경·결제·환불과 `order_events` 기록을 같은 트랜잭션에 저장합니다.
+  별도 outbox 작업자가 미발행 이벤트를 같은 토픽에 전송하고 `published_at`을 기록합니다.
+  Kafka 장애 후에도 재발행하며, 전송 직후 종료로 발생할 수 있는 중복은 `event_id`로 제거합니다.
+- 웹 스토어는 큐 API로 접수하고 작업 완료 후 주문 상세를 조회합니다. 대기 중 작업 ID는
+  탭의 `sessionStorage`에 보관해 새로고침 후에도 조회를 이어갑니다.
 - 아래 관리자 API 는 모두 유효한 관리자 세션 쿠키가 필요합니다.
 
 | 메서드 | 경로 | 설명 |
@@ -197,6 +205,11 @@ curl -X POST http://localhost:8081/api/v1/orders/queue \
 ```
 
 ### Redis 캐시
+
+조회 전에 캐시 세대를 읽고, 캐시 저장 시 Redis Lua에서 같은 세대인지 확인합니다.
+변경 요청이 캐시를 무효화한 뒤에는 이전 조회 결과가 캐시에 다시 저장되지 않습니다.
+Redis 장애 시 조회는 PostgreSQL로 진행하며, 캐시 삭제 실패 시에는 기존 TTL까지
+이전 값이 남을 수 있습니다.
 
 주문 목록/상세, 재고 목록/상세, 관리자 주문 목록/통계에 cache-aside 를 적용합니다.
 기본 TTL 은 `CACHE_TTL_SECONDS` (30초) 이며, 주문/재고 변경 시 관련 prefix 를
