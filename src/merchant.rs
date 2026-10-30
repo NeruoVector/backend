@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::{customer_auth, error::AppError, state::AppState};
 
+mod food_reference;
 mod merchant_admin;
 
 #[derive(Debug, Clone, Serialize)]
@@ -54,6 +55,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(merchant_admin::profile_router())
         .merge(merchant_admin::categories_router())
         .merge(merchant_admin::products_router())
+        .route("/merchant/food-reference", get(food_reference::search))
         .route_layer(middleware::from_fn_with_state(
             state,
             customer_auth::require_customer,
