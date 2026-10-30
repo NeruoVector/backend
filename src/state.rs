@@ -1,4 +1,4 @@
-use sqlx::PgPool;
+use crate::db::PgPool;
 
 use crate::{cache::Cache, events::KafkaPublisher, media::MediaClient};
 
@@ -14,6 +14,7 @@ pub struct AppState {
     pub admin_session_ttl_seconds: u64,
     pub admin_cookie_secure: bool,
     pub max_altitude_m: f64,
+    pub automatic_plan_altitude_reference: Option<crate::models::AltitudeReference>,
     pub route_max_leg_m: f64,
     pub route_max_distance_m: f64,
     pub route_battery_wh: f64,
@@ -45,6 +46,7 @@ pub(crate) fn test_state(pool: PgPool) -> AppState {
         admin_session_ttl_seconds: 86_400,
         admin_cookie_secure: false,
         max_altitude_m: 120.0,
+        automatic_plan_altitude_reference: None,
         route_max_leg_m: 5000.0,
         route_max_distance_m: 20_000.0,
         route_battery_wh: 500.0,

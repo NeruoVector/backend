@@ -8,7 +8,10 @@ use serde::Serialize;
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("database error: {0}")]
-    Database(#[from] sqlx::Error),
+    Database(#[from] tokio_postgres::Error),
+
+    #[error("database pool error: {0}")]
+    DatabasePool(#[from] deadpool_postgres::PoolError),
 
     #[error("cache error: {0}")]
     Redis(#[from] redis::RedisError),
@@ -51,9 +54,11 @@ impl IntoResponse for AppError {
             AppError::ServiceUnavailable(_) => {
                 (StatusCode::SERVICE_UNAVAILABLE, "service_unavailable")
             }
-            AppError::Database(_) | AppError::Redis(_) | AppError::Io(_) | AppError::Other(_) => {
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
-            }
+            AppError::DatabasePool(_)
+            | AppError::Database(_)
+            | AppError::Redis(_)
+            | AppError::Io(_)
+            | AppError::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
         };
 
         if status.is_server_error() {

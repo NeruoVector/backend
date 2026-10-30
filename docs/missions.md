@@ -2,7 +2,7 @@
 
 ## 처리 흐름
 
-1. 백엔드가 직선, 요청에 포함된 대안, 금지구역을 우회하는 제한된 가시성 그래프 후보를 만든다.
+1. 입력 경로의 모든 지점을 순서가 있는 필수 방문 지점으로 보존하고, 요청 대안과 각 구간의 제한된 가시성 그래프 우회 후보를 만든다.
 2. 각 후보의 좌표·고도·구간 거리·총 거리·예상 에너지·금지구역 교차를 검사한다.
 3. 유효 후보 중 3차원 이동 거리가 가장 짧은 후보를 저장한다.
 4. 드론의 독립 C++ 검증기가 동일한 후보들을 기체 자체 제한으로 다시 검사한다.
@@ -25,6 +25,7 @@
 | --- | --- | --- |
 | POST | `/api/v1/routes/plan` | 경로 후보 생성·검증, 경로 및 계획 저장 |
 | GET | `/api/v1/routes/plans/{id}` | 후보·모델 제한·검증 정보·`plan_text` 조회 |
+| GET | `/api/v1/routes/plans/by-route/{route_id}` | 해당 경로에 연결된 계획 조회 |
 | POST | `/api/v1/routes/plans/{id}/cross-check` | 독립 드론 검증 결과 비교 |
 
 DB에 `migrations/0007_mission_plans.sql`을 적용해야 한다. 이번 구현 작업에서는 실제 DB에 적용하지 않았다.
@@ -101,3 +102,75 @@ HAL의 기본 최대 전력 120W와 서버의 기존 평균 소비전력 기본�
 
 드론 검증은 정적 임무 검증이며 실제 자동 비행·수령 장치·장애물 관측 및 모터 제어는
 [드론 회피 계층](../../drone/docs/avoidance.md)과 상위 비행 제어기에 연결해야 한다.
+
+## 자동 배차와 필수 방문 계약
+
+자동 배차는 배송, 주문 정류장, 선택 경로 및 `planned` 상태의 미션을 하나의 트랜잭션으로 저장한다. 배송의 `route_id`를 `/routes/plans/by-route/{route_id}`로 조회해 `plan_text`, `route_fingerprint`, 계획 `id`를 가져오고 실제 독립 검증기의 결과를 `/routes/plans/{id}/cross-check`에 제출한다. 검증 성공만으로 출발하지 않으며 측정 적재량, 주문 준비·결제, 기체 상태, 만료 및 에너지 등 기존 출발 조건도 충족해야 한다. 자동 계획의 유효 기간은 생성 후 1800초다.
+
+`NVPLAN2`는 창문 정보 다음에 필수 지점 개수와 위도·경도·고도 행을 둔다. 모든 후보는 출발과 도착을 포함한 이 지점들을 서로 다른 인덱스에서 순서대로 방문해야 한다. 기지로 돌아오는 경우 같은 기지 좌표도 별도의 출발·도착 방문이다. 창문 좌표는 실제 비행 지점이 아니므로 마지막 창문 좌표 대신 외부 접근 및 이격 정지 지점을 필수 지점으로 사용한다. 배송 출발 시 주문 정류장 좌표와 필수 지점의 순서도 다시 비교한다.
+
+기존 `NVPLAN1` 계획과 필수 지점 정보가 없는 저장 계획은 출발 또는 교차 검증에 사용할 수 없다. 새 `NVPLAN2` 계획을 생성하고 독립 검증을 다시 받아야 한다. 자동 배차의 오래된 계획은 현재 자동 재계획 API가 없으므로 만료되면 기존 배송을 취소하고 다시 배차해야 한다.
+
+텔레메트리 권한 마이그레이션 `0013`은 과거 표본의 승인 여부를 복원할 수 없어 기존 이력은 유지하되 현재 상태로 신뢰하지 않는다. 배포 시 마이그레이션을 먼저 적용하고 새 수신기를 사용하며, 신선한 새 표본이 도착한 뒤 배차·출발·도착 판정이 가능하다. 이전 수신기와 새 수신기를 혼용하지 않는다.
+
+### Active delivery plan replacement
+
+An authenticated administrator can inspect ordered delivery stops with
+`GET /api/v1/admin/deliveries/{delivery_id}/stops`. Each result contains
+`order_id`, `stop_sequence`, and `status`. A replacement is submitted to
+`POST /api/v1/admin/deliveries/{delivery_id}/activate-plan` with
+`{"plan_id":"...","expected_route_id":"...","expected_telemetry_id":123,"altitude_reference":"plan"}`.
+Log in through `/api/v1/admin/auth/login` and send the resulting administrator
+session cookie. `altitude_reference: plan` asserts that the telemetry altitude
+and candidate waypoint altitudes use the same reference; the server cannot
+independently establish that datum.
+
+Create and independently cross-check the candidate first. Activation checks the
+verified, unexpired NVPLAN2 plan against current no-fly zones and the drone's
+constraints; it preserves remaining customer stop order and altitude, the
+original return point, and any window target. Duplicate customer coordinates
+are rejected because their association with distinct original altitudes is
+ambiguous. The candidate must start within 2 m horizontally and 3 m vertically
+of the latest accepted in-flight pose. That pose's device and receive timestamps
+must both be at most 5 seconds old, and horizontal and vertical speeds must be
+present, finite, and at most 1 m/s in magnitude. A recent positive payload
+measurement, capacity, battery reserve, and drone flight constraints are also
+required. The expected route and telemetry IDs prevent a stale request or replay;
+replacement and per-order audit events commit atomically. Telemetry and payload
+measurement writers serialize with the relevant delivery lock.
+
+The route cross-check and FNV fingerprint detect consistency errors, but do not
+provide cryptographic drone identity. Activation updates the backend's selected
+route; it does not command an aircraft. An independently authenticated flight
+controller must hold position while planning, obtain and validate the selected
+plan, and execute it using a common altitude reference.
+
+### Arrival altitude reference
+
+`altitude_reference` is an optional typed field in telemetry and in plan requests;
+`home_relative` means altitude in metres above the same verified vehicle home.
+`mean_sea_level` is accepted as a distinct telemetry/plan declaration but is not
+currently eligible for arrival. An omitted declaration remains unknown, including
+for existing persisted plans and telemetry. Automatic plans use the startup
+`AUTOMATIC_PLAN_ALTITUDE_REFERENCE` setting, which defaults to unknown. Set it to
+`home_relative` only where the deployment has independently established the
+vehicle and plan share that home; this is a declaration, not proof of calibration.
+An explicit plan request may declare a reference only if it matches that configured
+deployment profile; an unknown profile cannot be upgraded by a plan request.
+Plan creation and native cross-check endpoints are public, while activation is
+admin-gated; the profile constrains a public declaration but does not authenticate
+the planner or telemetry producer.
+The declaration is persisted in the JSON plan payload and does not change NVPLAN2.
+The native checker validates the numerical route, but does not bind or attest the
+JSON datum declaration in its NVPLAN2 fingerprint.
+
+Arrival and PIN require the active verified plan's unique mandatory customer
+waypoint, a current accepted sample from its active flight, and a continuous
+10-second hold of samples no more than six seconds apart. Every sample must be
+within 3 m horizontally and 1 m vertically of the waypoint, with horizontal
+speed at most 1 m/s and absolute vertical speed at most 0.5 m/s. Both device and
+receive time of the latest sample must be at most five seconds old. A missing or
+mismatched datum, absent altitude or speed, unknown legacy plan, missing stop,
+or stale/moving pose blocks arrival and PIN; an old arrived status alone is not
+sufficient. Source timestamps and the datum are assertions and cannot establish
+physical position or calibration cryptographically.

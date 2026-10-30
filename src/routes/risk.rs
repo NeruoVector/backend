@@ -86,7 +86,7 @@ pub struct Hotspot {
     pub risk_score: f64,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct HotspotRow {
     latitude: f64,
     longitude: f64,
@@ -94,6 +94,13 @@ struct HotspotRow {
     average_confidence: f64,
     last_seen: DateTime<Utc>,
 }
+crate::db::row!(HotspotRow {
+    latitude,
+    longitude,
+    incident_count,
+    average_confidence,
+    last_seen
+});
 
 async fn predict(
     State(state): State<AppState>,
@@ -132,7 +139,8 @@ async fn predict(
         _ => (-90.0, 90.0, -180.0, 180.0),
     };
 
-    let mut detections = sqlx::query_as::<_, Detection>(
+    let mut detections = crate::db::fetch_all::<Detection>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
                priority_level, detected_at, created_at
@@ -145,14 +153,15 @@ async fn predict(
         ORDER BY detected_at DESC
         LIMIT 5000
         "#,
+        &[
+            &(since),
+            &(drone_id.as_deref()),
+            &(route_points.as_ref().map(|_| min_lat)),
+            &(route_points.as_ref().map(|_| max_lat)),
+            &(route_points.as_ref().map(|_| min_lon)),
+            &(route_points.as_ref().map(|_| max_lon)),
+        ],
     )
-    .bind(since)
-    .bind(drone_id.as_deref())
-    .bind(route_points.as_ref().map(|_| min_lat))
-    .bind(route_points.as_ref().map(|_| max_lat))
-    .bind(route_points.as_ref().map(|_| min_lon))
-    .bind(route_points.as_ref().map(|_| max_lon))
-    .fetch_all(&state.pool)
     .await?;
 
     if let Some(points) = &route_points {
@@ -267,7 +276,8 @@ async fn hotspots(
     let limit = params.limit.unwrap_or(20).clamp(1, 100);
     let since = Utc::now() - Duration::days(days);
 
-    let rows = sqlx::query_as::<_, HotspotRow>(
+    let rows = crate::db::fetch_all::<HotspotRow>(
+        &state.pool.get().await?,
         r#"
         SELECT round(latitude::numeric, 3)::float8 AS latitude,
                round(longitude::numeric, 3)::float8 AS longitude,
@@ -283,11 +293,8 @@ async fn hotspots(
         ORDER BY incident_count DESC, last_seen DESC
         LIMIT $3
         "#,
+        &[&(since), &(params.drone_id.as_deref()), &(limit)],
     )
-    .bind(since)
-    .bind(params.drone_id.as_deref())
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
 
     let hotspots = rows

@@ -7,7 +7,7 @@ use axum::{
     routing::get,
 };
 use serde::Serialize;
-use sqlx::postgres::PgPoolOptions;
+
 use tower_http::{
     cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer},
     trace::TraceLayer,
@@ -17,20 +17,27 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 mod auth;
 mod cache;
 mod config;
+mod customer_auth;
+mod customer_order;
 mod db;
 mod docs;
 mod error;
 mod events;
 mod geo;
+mod handoff;
 mod ingest;
 mod media;
+mod merchant;
 mod mission;
 mod models;
 mod mqtt;
+mod oauth_provider;
 mod order_queue;
 mod redis_store;
 mod routes;
 mod state;
+mod student;
+mod student_admin;
 
 use events::KafkaPublisher;
 use media::MediaClient;
@@ -50,11 +57,9 @@ async fn main() -> anyhow::Result<()> {
     let config = config::Config::from_env()?;
     tracing::info!(?config.public_base_url, "starting neurovector-backend");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(config.database_max_connections)
-        .connect(&config.database_url)
-        .await?;
+    let pool = db::pool(&config.database_url, config.database_max_connections)?;
 
+    drop(pool.get().await?);
     auth::bootstrap_admin(&pool, &config.admin_username, &config.admin_password).await?;
 
     let redis = redis_store::RedisStore::new(
@@ -92,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         admin_session_ttl_seconds: config.admin_session_ttl_seconds,
         admin_cookie_secure: config.admin_cookie_secure,
         max_altitude_m: config.max_altitude_m,
+        automatic_plan_altitude_reference: config.automatic_plan_altitude_reference,
         route_max_leg_m: config.route_max_leg_m,
         route_max_distance_m: config.route_max_distance_m,
         route_battery_wh: config.route_battery_wh,
@@ -103,6 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     mqtt::spawn(state.clone(), &config);
     order_queue::spawn_worker(state.clone(), &config);
+    let _delivery_scheduler = routes::scheduling::spawn_scheduler(state.clone());
 
     let cors_origins = config
         .cors_allowed_origins
@@ -128,7 +135,15 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi()))
         .nest("/api/v1", routes::router(state.clone()))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<_>| {
+                tracing::info_span!(
+                    "http_request",
+                    method = %request.method(),
+                    path = %request.uri().path()
+                )
+            }),
+        )
         .with_state(state);
 
     let addr: SocketAddr = config.listen_addr.parse()?;

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 /// 장애물 감지 1건 (DB row + API 응답).
-#[derive(Debug, Serialize, sqlx::FromRow)]
+#[derive(Debug, Serialize)]
 pub struct Detection {
     pub id: Uuid,
     pub drone_id: String,
@@ -17,6 +17,18 @@ pub struct Detection {
     pub detected_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
 }
+crate::db::row!(Detection {
+    id,
+    drone_id,
+    label,
+    confidence,
+    latitude,
+    longitude,
+    distance_m,
+    priority_level,
+    detected_at,
+    created_at
+});
 
 /// HTTP / MQTT 로 들어오는 감지 이벤트.
 #[derive(Debug, Deserialize)]
@@ -33,7 +45,7 @@ pub struct CreateDetection {
 }
 
 /// 비행 세션 (DB row + API 응답).
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FlightSession {
     pub id: Uuid,
     pub drone_id: String,
@@ -43,9 +55,18 @@ pub struct FlightSession {
     pub ended_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
+crate::db::row!(FlightSession {
+    id,
+    drone_id,
+    delivery_id,
+    status,
+    started_at,
+    ended_at,
+    created_at
+});
 
 /// 텔레메트리 1건 (DB row + API 응답).
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Telemetry {
     pub id: i64,
     pub drone_id: String,
@@ -61,8 +82,30 @@ pub struct Telemetry {
     pub status: Option<String>,
     pub received_at: DateTime<Utc>,
 }
+crate::db::row!(Telemetry {
+    id,
+    drone_id,
+    flight_id,
+    ts,
+    latitude,
+    longitude,
+    altitude_m,
+    speed_mps,
+    vertical_speed_mps,
+    battery_pct,
+    heading_deg,
+    status,
+    received_at
+});
 
 /// MQTT `neurovector/drones/{drone_id}/telemetry` 페이로드.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum AltitudeReference {
+    HomeRelative,
+    MeanSeaLevel,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct TelemetryMessage {
     pub ts: Option<DateTime<Utc>>,
@@ -72,6 +115,7 @@ pub struct TelemetryMessage {
     pub longitude: Option<f64>,
     #[serde(alias = "alt", alias = "altitude")]
     pub altitude_m: Option<f64>,
+    pub altitude_reference: Option<AltitudeReference>,
     #[serde(alias = "ground_speed", alias = "speed")]
     pub speed_mps: Option<f64>,
     #[serde(alias = "vz", alias = "climb_rate")]

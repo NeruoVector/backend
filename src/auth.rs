@@ -1,3 +1,4 @@
+use crate::db::PgPool;
 use argon2::{
     Argon2,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -12,7 +13,6 @@ use axum::{
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{FromRow, PgPool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -38,23 +38,32 @@ pub struct AdminSessionInfo {
     pub expires_at: DateTime<Utc>,
 }
 
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 struct AdminCredential {
     user_id: Uuid,
     username: String,
     password_hash: String,
 }
+crate::db::row!(AdminCredential {
+    user_id,
+    username,
+    password_hash
+});
 
-#[derive(Debug, FromRow)]
+#[derive(Debug)]
 struct SessionRow {
     session_id: Uuid,
     username: String,
     expires_at: DateTime<Utc>,
 }
+crate::db::row!(SessionRow {
+    session_id,
+    username,
+    expires_at
+});
 
-/// 환경 변수에 설정된 관리자 계정을 보장한다.
-///
-/// 기존 계정이 있고 비밀번호가 바뀌면 해시를 갱신하고 기존 세션을 모두 폐기한다.
+/// Ensure the configured administrator exists, rotating an established account only
+/// when its configured password changes. A concurrent creator never rotates the winner.
 pub async fn bootstrap_admin(pool: &PgPool, username: &str, password: &str) -> anyhow::Result<()> {
     let username = username.trim();
     if username.is_empty() {
@@ -64,48 +73,49 @@ pub async fn bootstrap_admin(pool: &PgPool, username: &str, password: &str) -> a
         anyhow::bail!("ADMIN_PASSWORD must not be empty");
     }
 
-    let existing = sqlx::query_as::<_, (Uuid, String)>(
-        "SELECT id, password_hash FROM neurovector.admin_users WHERE username = $1",
+    let existing = crate::db::scalar_optional::<Uuid>(
+        &pool.get().await?,
+        "SELECT id FROM neurovector.admin_users WHERE username = $1",
+        &[&username],
     )
-    .bind(username)
-    .fetch_optional(pool)
     .await?;
-
-    if let Some((user_id, password_hash)) = existing {
-        if verify_password_async(password.to_owned(), password_hash).await? {
-            return Ok(());
-        }
-
-        let next_hash = hash_password_async(password.to_owned()).await?;
-        let mut tx = pool.begin().await?;
-        sqlx::query(
-            "UPDATE neurovector.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1",
+    if existing.is_none() {
+        let password_hash = hash_password_async(password.to_owned()).await?;
+        let inserted = crate::db::execute(
+            &pool.get().await?,
+            "INSERT INTO neurovector.admin_users (username, password_hash) VALUES ($1, $2) ON CONFLICT (username) DO NOTHING",
+            &[&username, &password_hash],
         )
-        .bind(user_id)
-        .bind(&next_hash)
-        .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM neurovector.admin_sessions WHERE user_id = $1")
-            .bind(user_id)
-            .execute(&mut *tx)
-            .await?;
-        tx.commit().await?;
+        if inserted == 1 {
+            tracing::info!(username, "admin account created");
+        }
+        return Ok(());
+    }
+
+    let mut connection = pool.get().await?;
+    let tx = connection.transaction().await?;
+    let (user_id, password_hash) = crate::db::fetch_one::<(Uuid, String)>(
+        &tx,
+        "SELECT id, password_hash FROM neurovector.admin_users WHERE username = $1 FOR UPDATE",
+        &[&username],
+    )
+    .await?;
+    if !verify_password_async(password.to_owned(), password_hash).await? {
+        let next_hash = hash_password_async(password.to_owned()).await?;
+        crate::db::execute(&tx, "UPDATE neurovector.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1", &[&user_id, &next_hash]).await?;
+        crate::db::execute(
+            &tx,
+            "DELETE FROM neurovector.admin_sessions WHERE user_id = $1",
+            &[&user_id],
+        )
+        .await?;
         tracing::info!(
             username,
             "admin password updated; existing sessions revoked"
         );
-    } else {
-        let password_hash = hash_password_async(password.to_owned()).await?;
-        sqlx::query(
-            "INSERT INTO neurovector.admin_users (username, password_hash) VALUES ($1, $2)",
-        )
-        .bind(username)
-        .bind(password_hash)
-        .execute(pool)
-        .await?;
-        tracing::info!(username, "admin account created");
     }
-
+    tx.commit().await?;
     Ok(())
 }
 
@@ -130,15 +140,15 @@ pub(crate) async fn login(
         ));
     }
 
-    let credential = sqlx::query_as::<_, AdminCredential>(
+    let credential = crate::db::fetch_optional::<AdminCredential>(
+        &state.pool.get().await?,
         r#"
         SELECT id AS user_id, username, password_hash
         FROM neurovector.admin_users
         WHERE username = $1
         "#,
+        &[&(username)],
     )
-    .bind(username)
-    .fetch_optional(&state.pool)
     .await?;
 
     let Some(credential) = credential else {
@@ -186,10 +196,12 @@ pub(crate) async fn logout(
     headers: HeaderMap,
 ) -> Result<(StatusCode, HeaderMap), AppError> {
     if let Some(token) = cookie_value(&headers, SESSION_COOKIE_NAME) {
-        sqlx::query("DELETE FROM neurovector.admin_sessions WHERE session_hash = $1")
-            .bind(hash_token(&token))
-            .execute(&state.pool)
-            .await?;
+        crate::db::execute(
+            &state.pool.get().await?,
+            "DELETE FROM neurovector.admin_sessions WHERE session_hash = $1",
+            &[&(hash_token(&token))],
+        )
+        .await?;
     }
 
     let mut response_headers = HeaderMap::new();
@@ -236,7 +248,8 @@ pub async fn require_admin(
         .ok_or_else(|| AppError::Unauthorized("관리자 로그인이 필요합니다.".into()))?;
     let session_hash = hash_token(&token);
 
-    let session = sqlx::query_as::<_, SessionRow>(
+    let session = crate::db::fetch_optional::<SessionRow>(
+        &state.pool.get().await?,
         r#"
         SELECT s.id AS session_id, u.username, s.expires_at
         FROM neurovector.admin_sessions s
@@ -244,19 +257,19 @@ pub async fn require_admin(
         WHERE s.session_hash = $1
           AND s.expires_at > now()
         "#,
+        &[&(session_hash)],
     )
-    .bind(session_hash)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| {
         AppError::Unauthorized("관리자 세션이 만료되었거나 유효하지 않습니다.".into())
     })?;
 
-    if let Err(err) =
-        sqlx::query("UPDATE neurovector.admin_sessions SET last_seen_at = now() WHERE id = $1")
-            .bind(session.session_id)
-            .execute(&state.pool)
-            .await
+    if let Err(err) = crate::db::execute(
+        &state.pool.get().await?,
+        "UPDATE neurovector.admin_sessions SET last_seen_at = now() WHERE id = $1",
+        &[&(session.session_id)],
+    )
+    .await
     {
         tracing::warn!(error = %err, "failed to update admin session last_seen_at");
     }
@@ -277,19 +290,18 @@ async fn create_session(
     let token = format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
     let expires_at = Utc::now() + Duration::seconds(ttl_seconds as i64);
 
-    let mut tx = state.pool.begin().await?;
-    sqlx::query("DELETE FROM neurovector.admin_sessions WHERE expires_at < now()")
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query(
-        "INSERT INTO neurovector.admin_sessions (session_hash, user_id, expires_at) VALUES ($1, $2, $3)",
+    let mut connection = state.pool.get().await?;
+    let tx = connection.transaction().await?;
+    crate::db::execute(
+        &tx,
+        "DELETE FROM neurovector.admin_sessions WHERE expires_at < now()",
+        &[],
     )
-    .bind(hash_token(&token))
-    .bind(user_id)
-    .bind(expires_at)
-    .execute(&mut *tx)
+    .await?;
+    crate::db::execute(&tx, "INSERT INTO neurovector.admin_sessions (session_hash, user_id, expires_at) VALUES ($1, $2, $3)", &[&(hash_token(&token)), &(user_id), &(expires_at)])
     .await?;
     tx.commit().await?;
+    drop(connection);
 
     Ok((token, expires_at))
 }
@@ -365,6 +377,67 @@ fn cleared_session_cookie(secure: bool) -> HeaderValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    #[ignore = "requires an isolated TEST_DATABASE_URL with migrations"]
+    async fn concurrent_bootstrap_preserves_existing_credentials_and_sessions() -> anyhow::Result<()>
+    {
+        let pool = crate::db::pool(&std::env::var("TEST_DATABASE_URL")?, 4)?;
+        let username = format!("qa-bootstrap-{}", Uuid::new_v4());
+        let (first, second) = tokio::join!(
+            bootstrap_admin(&pool, &username, "synthetic-password"),
+            bootstrap_admin(&pool, &username, "synthetic-password")
+        );
+        first?;
+        second?;
+        let (id, before) = crate::db::fetch_one::<(Uuid, String)>(
+            &pool.get().await?,
+            "SELECT id, password_hash FROM neurovector.admin_users WHERE username=$1",
+            &[&username],
+        )
+        .await?;
+        crate::db::execute(&pool.get().await?,
+            "INSERT INTO neurovector.admin_sessions(user_id,session_hash,expires_at) VALUES ($1,$2,now()+interval '1 hour')",
+            &[&id, &username]).await?;
+        bootstrap_admin(&pool, &username, "synthetic-password").await?;
+        let after = crate::db::scalar_one::<String>(
+            &pool.get().await?,
+            "SELECT password_hash FROM neurovector.admin_users WHERE id=$1",
+            &[&id],
+        )
+        .await?;
+        let sessions = crate::db::scalar_one::<i64>(
+            &pool.get().await?,
+            "SELECT count(*) FROM neurovector.admin_sessions WHERE user_id=$1",
+            &[&id],
+        )
+        .await?;
+        assert_eq!(before, after);
+        assert_eq!(sessions, 1);
+        assert!(verify_password("synthetic-password", &after));
+        bootstrap_admin(&pool, &username, "new-synthetic-password").await?;
+        let rotated = crate::db::scalar_one::<String>(
+            &pool.get().await?,
+            "SELECT password_hash FROM neurovector.admin_users WHERE id=$1",
+            &[&id],
+        )
+        .await?;
+        let sessions = crate::db::scalar_one::<i64>(
+            &pool.get().await?,
+            "SELECT count(*) FROM neurovector.admin_sessions WHERE user_id=$1",
+            &[&id],
+        )
+        .await?;
+        assert!(verify_password("new-synthetic-password", &rotated));
+        assert_eq!(sessions, 0);
+        crate::db::execute(
+            &pool.get().await?,
+            "DELETE FROM neurovector.admin_users WHERE id=$1",
+            &[&id],
+        )
+        .await?;
+        Ok(())
+    }
 
     #[test]
     fn password_hash_roundtrip() {

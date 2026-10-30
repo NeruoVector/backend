@@ -41,6 +41,7 @@ pub struct Config {
 
     // 경로 검증 / 위험 예측 기본값
     pub max_altitude_m: f64,
+    pub automatic_plan_altitude_reference: Option<crate::models::AltitudeReference>,
     pub route_max_leg_m: f64,
     pub route_max_distance_m: f64,
     pub route_battery_wh: f64,
@@ -79,10 +80,7 @@ impl Config {
         let admin_session_ttl_seconds = parse_env("ADMIN_SESSION_TTL_SECONDS", 86_400u64)?;
         let admin_cookie_secure = parse_env("ADMIN_COOKIE_SECURE", false)?;
         let cors_allowed_origins = env::var("CORS_ALLOWED_ORIGINS")
-            .unwrap_or_else(|_| {
-                "http://localhost:5173,http://127.0.0.1:5173,http://localhost:8081,http://127.0.0.1:8081"
-                    .to_string()
-            })
+            .unwrap_or_else(|_| "http://localhost:5173,http://127.0.0.1:5173".to_string())
             .split(',')
             .map(str::trim)
             .filter(|origin| !origin.is_empty())
@@ -111,6 +109,15 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("./recordings"));
 
         let max_altitude_m = parse_env("MAX_ALTITUDE_M", 120.0f64)?;
+        let automatic_plan_altitude_reference =
+            match env::var("AUTOMATIC_PLAN_ALTITUDE_REFERENCE").as_deref() {
+                Ok("") | Err(env::VarError::NotPresent) => None,
+                Ok("home_relative") => Some(crate::models::AltitudeReference::HomeRelative),
+                Ok(_) => anyhow::bail!(
+                    "AUTOMATIC_PLAN_ALTITUDE_REFERENCE must be empty or home_relative"
+                ),
+                Err(_) => anyhow::bail!("AUTOMATIC_PLAN_ALTITUDE_REFERENCE is not valid Unicode"),
+            };
         let route_max_leg_m = parse_env("ROUTE_MAX_LEG_M", 5_000.0f64)?;
         let route_max_distance_m = parse_env("ROUTE_MAX_DISTANCE_M", 20_000.0f64)?;
         let route_battery_wh = parse_env("ROUTE_BATTERY_WH", 500.0f64)?;
@@ -167,6 +174,7 @@ impl Config {
             media_srt_port,
             media_recordings_dir,
             max_altitude_m,
+            automatic_plan_altitude_reference,
             route_max_leg_m,
             route_max_distance_m,
             route_battery_wh,

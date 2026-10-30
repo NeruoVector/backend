@@ -1,7 +1,7 @@
 use super::*;
 use crate::state::test_state;
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+
 use std::{fs, path::PathBuf};
 
 fn number(value: &Value) -> f64 {
@@ -43,8 +43,17 @@ fn output_plan(
         .map(|(i, _)| i)
         .expect("at least one valid school candidate");
     let payload = PlanPayload {
+        altitude_reference: None,
         constraints: constraints(state, &candidates[selected_index], hold),
         selected_index,
+        required_stops: if window.is_some() {
+            candidates[selected_index].waypoints.clone()
+        } else {
+            vec![
+                candidates[0].waypoints[0].clone(),
+                candidates[0].waypoints.last().unwrap().clone(),
+            ]
+        },
         candidates,
         validations,
         zones: zones.to_vec(),
@@ -75,9 +84,7 @@ async fn school_fixture_routes_and_window() {
         PathBuf::from(std::env::var("SCHOOL_ARTIFACT_DIR").expect("SCHOOL_ARTIFACT_DIR required"));
     let fixture: Value = serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
     assert_eq!(fixture["synthetic"], true);
-    let pool = PgPoolOptions::new()
-        .connect_lazy("postgres://dummy:dummy@127.0.0.1:1/dummy")
-        .unwrap();
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
     let mut state = test_state(pool);
     state.route_power_w = number(&fixture["drone"]["modeled_power_w"]);
     state.route_battery_wh = number(&fixture["drone"]["battery_wh"]);
@@ -185,4 +192,313 @@ async fn school_fixture_routes_and_window() {
         &zones,
         Some(target),
     );
+}
+
+#[tokio::test]
+#[ignore = "requires isolated TEST_DATABASE_URL with migrations"]
+async fn round_trip_plan_preserves_customer_stop() {
+    let url = std::env::var("TEST_DATABASE_URL").expect("isolated database URL");
+    let state = test_state(crate::db::pool(&url, 2).unwrap());
+    let home = Waypoint {
+        lat: 37.499,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let customer = Waypoint {
+        lat: 37.5,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let route = RouteInput {
+        name: "regression-round-trip".into(),
+        drone_id: Some("regression-drone".into()),
+        waypoints: vec![home.clone(), customer.clone(), home],
+        cruise_speed_mps: Some(5.0),
+        max_altitude_m: Some(30.0),
+    };
+    let (_, Json(plan)) = create_plan(
+        State(state),
+        Json(PlanInput {
+            altitude_reference: None,
+            route,
+            alternatives: vec![],
+            window_target: None,
+            expires_in_seconds: 600,
+        }),
+    )
+    .await
+    .unwrap();
+    if let Ok(directory) = std::env::var("PLANNING_FIXTURE_DIR") {
+        fs::write(
+            PathBuf::from(directory).join("roundtrip.nvplan"),
+            &plan.plan_text,
+        )
+        .unwrap();
+    }
+    let payload: PlanPayload = serde_json::from_value(plan.payload).unwrap();
+    let selected = &payload.candidates[payload.selected_index];
+    assert!(
+        selected
+            .waypoints
+            .iter()
+            .any(|point| same(point, &customer)),
+        "selected plan omitted customer stop: {:?}",
+        selected.waypoints
+    );
+    assert!((payload.validations[payload.selected_index].distance_m - 222.389853).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn candidates_keep_ordered_multistop_and_reject_shortcuts() {
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
+    let state = test_state(pool);
+    let home = Waypoint {
+        lat: 37.499,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let first = Waypoint {
+        lat: 37.5,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let second = Waypoint {
+        lat: 37.501,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let route = RouteInput {
+        name: "multi".into(),
+        drone_id: Some("test".into()),
+        waypoints: vec![home.clone(), first.clone(), second.clone(), home.clone()],
+        cruise_speed_mps: Some(5.0),
+        max_altitude_m: Some(30.0),
+    };
+    let input = PlanInput {
+        altitude_reference: None,
+        route: route.clone(),
+        alternatives: vec![],
+        window_target: None,
+        expires_in_seconds: 600,
+    };
+    let payload = build_payload(&state, input, vec![]).unwrap();
+    if let Ok(directory) = std::env::var("PLANNING_FIXTURE_DIR") {
+        let text = plan_text(
+            Uuid::new_v4(),
+            "test",
+            Utc::now() + Duration::seconds(600),
+            &payload,
+        )
+        .unwrap();
+        fs::write(PathBuf::from(directory).join("multistop.nvplan"), text).unwrap();
+    }
+    assert!(
+        payload
+            .candidates
+            .iter()
+            .all(|candidate| contains_required(&candidate.waypoints, &route.waypoints))
+    );
+    let shortcut = PlanInput {
+        altitude_reference: None,
+        route,
+        alternatives: vec![vec![home.clone(), second, first, home]],
+        window_target: None,
+        expires_in_seconds: 600,
+    };
+    assert!(build_payload(&state, shortcut, vec![]).is_err());
+}
+
+#[tokio::test]
+async fn generated_detour_preserves_each_ordered_stop() {
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
+    let state = test_state(pool);
+    let waypoint = |lat, lon| Waypoint {
+        lat,
+        lon,
+        altitude_m: 30.0,
+    };
+    let home = waypoint(37.499, 127.0);
+    let customer = waypoint(37.501, 127.0);
+    let polygon = vec![
+        waypoint(37.4998, 126.9998),
+        waypoint(37.5002, 126.9998),
+        waypoint(37.5002, 127.0002),
+        waypoint(37.4998, 127.0002),
+    ];
+    let zone = NoFlyZoneRow {
+        id: Uuid::new_v4(),
+        name: "test zone".into(),
+        polygon: serde_json::to_value(polygon).unwrap(),
+        max_altitude_m: Some(100.0),
+    };
+    let required = vec![home.clone(), customer, home];
+    let route = RouteInput {
+        name: "roundtrip detour".into(),
+        drone_id: Some("test".into()),
+        waypoints: required.clone(),
+        cruise_speed_mps: Some(5.0),
+        max_altitude_m: Some(30.0),
+    };
+    let payload = build_payload(
+        &state,
+        PlanInput {
+            altitude_reference: None,
+            route,
+            alternatives: vec![],
+            window_target: None,
+            expires_in_seconds: 600,
+        },
+        vec![zone],
+    )
+    .unwrap();
+    assert!(payload.candidates[payload.selected_index].waypoints.len() > required.len());
+    assert!(
+        payload
+            .candidates
+            .iter()
+            .all(|candidate| contains_required(&candidate.waypoints, &required))
+    );
+}
+
+#[tokio::test]
+async fn planning_rejects_visibility_graph_limits_before_selecting_a_route() {
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
+    let state = test_state(pool);
+    let input = || PlanInput {
+        altitude_reference: None,
+        route: RouteInput {
+            name: "bounded graph".into(),
+            drone_id: Some("test".into()),
+            waypoints: vec![
+                Waypoint {
+                    lat: 37.0,
+                    lon: 127.0,
+                    altitude_m: 30.0,
+                },
+                Waypoint {
+                    lat: 37.001,
+                    lon: 127.0,
+                    altitude_m: 30.0,
+                },
+            ],
+            cruise_speed_mps: Some(5.0),
+            max_altitude_m: Some(30.0),
+        },
+        alternatives: vec![],
+        window_target: None,
+        expires_in_seconds: 600,
+    };
+    let zone = NoFlyZoneRow {
+        id: Uuid::new_v4(),
+        name: "distant zone".into(),
+        polygon: json!([
+            {"lat":38.0,"lon":128.0,"altitude_m":30.0},
+            {"lat":38.0,"lon":128.001,"altitude_m":30.0},
+            {"lat":38.001,"lon":128.001,"altitude_m":30.0},
+            {"lat":38.001,"lon":128.0,"altitude_m":30.0}
+        ]),
+        max_altitude_m: Some(100.0),
+    };
+
+    assert!(build_payload(&state, input(), vec![zone.clone(); 31]).is_ok());
+    assert!(build_payload(&state, input(), vec![zone.clone(); 32]).is_err());
+    assert!(build_payload(&state, input(), vec![zone; 65]).is_err());
+}
+
+#[tokio::test]
+async fn window_required_stops_replace_facade_with_exterior_points() {
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
+    let state = test_state(pool);
+    let point = |lat| Waypoint {
+        lat,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let start = point(37.498);
+    let intermediate = point(37.499);
+    let window = point(37.5);
+    let route = RouteInput {
+        name: "window".into(),
+        drone_id: Some("test".into()),
+        waypoints: vec![start, intermediate.clone(), window.clone()],
+        cruise_speed_mps: Some(5.0),
+        max_altitude_m: Some(30.0),
+    };
+    let target = WindowTarget {
+        window: window.clone(),
+        outward_bearing_deg: 180.0,
+        standoff_m: 3.0,
+        approach_distance_m: 15.0,
+        hold_seconds: 30.0,
+    };
+    let payload = build_payload(
+        &state,
+        PlanInput {
+            altitude_reference: None,
+            route,
+            alternatives: vec![],
+            window_target: Some(target),
+            expires_in_seconds: 600,
+        },
+        vec![],
+    )
+    .unwrap();
+    assert!(same(&payload.required_stops[1], &intermediate));
+    assert!(!payload.required_stops.iter().any(|p| same(p, &window)));
+    assert!(
+        payload
+            .candidates
+            .iter()
+            .all(|candidate| contains_required(&candidate.waypoints, &payload.required_stops))
+    );
+    assert_eq!(payload.constraints.hold_seconds, 30.0);
+    assert!(delivery_stops_match(
+        &payload,
+        &[(Some(window.lat), Some(window.lon))],
+        false
+    ));
+    assert!(!delivery_stops_match(
+        &payload,
+        &[(Some(window.lat), Some(window.lon))],
+        true
+    ));
+}
+
+#[tokio::test]
+async fn dispatch_stop_guard_accepts_one_way_and_rejects_missing_roundtrip_customer() {
+    let pool = crate::db::pool("postgres://dummy:dummy@127.0.0.1:1/dummy", 1).unwrap();
+    let state = test_state(pool);
+    let home = Waypoint {
+        lat: 37.499,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let customer = Waypoint {
+        lat: 37.5,
+        lon: 127.0,
+        altitude_m: 30.0,
+    };
+    let route = RouteInput {
+        name: "oneway".into(),
+        drone_id: Some("test".into()),
+        waypoints: vec![home, customer.clone()],
+        cruise_speed_mps: Some(5.0),
+        max_altitude_m: Some(30.0),
+    };
+    let payload = build_payload(
+        &state,
+        PlanInput {
+            altitude_reference: None,
+            route,
+            alternatives: vec![],
+            window_target: None,
+            expires_in_seconds: 600,
+        },
+        vec![],
+    )
+    .unwrap();
+    let stops = [(Some(customer.lat), Some(customer.lon))];
+    assert!(delivery_stops_match(&payload, &stops, false));
+    assert!(!delivery_stops_match(&payload, &stops, true));
+    assert!(!delivery_stops_match(&payload, &[], true));
 }

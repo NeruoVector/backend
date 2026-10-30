@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::FromRow;
+
 use utoipa::{IntoParams, ToSchema};
 use uuid::Uuid;
 
@@ -29,6 +29,14 @@ pub fn router(state: AppState) -> Router<AppState> {
         .route("/order-jobs/{id}/cancel", post(admin_cancel_job))
         .route("/order-events", get(admin_list_events))
         .route("/queue/stats", get(admin_queue_stats))
+        .route(
+            "/deliveries/{id}/stops",
+            get(crate::mission::activation::list_stops),
+        )
+        .route(
+            "/deliveries/{id}/activate-plan",
+            post(crate::mission::activation::activate_plan),
+        )
         .route("/cache/stats", get(admin_cache_stats))
         .route("/auth/me", get(auth::me))
         .route_layer(middleware::from_fn_with_state(state, auth::require_admin));
@@ -66,7 +74,7 @@ pub struct AdminOrderList {
     pub offset: i64,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, FromRow, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct AdminOrderStats {
     pub total_orders: i64,
     pub pending_payment: i64,
@@ -82,6 +90,21 @@ pub struct AdminOrderStats {
     pub revenue: i64,
     pub delivered_revenue: i64,
 }
+crate::db::row!(AdminOrderStats {
+    total_orders,
+    pending_payment,
+    paid,
+    preparing,
+    ready,
+    assigned,
+    in_transit,
+    delivered,
+    cancelled,
+    failed,
+    today_orders,
+    revenue,
+    delivered_revenue
+});
 
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -103,13 +126,14 @@ pub struct ListEventsParams {
     pub limit: Option<i64>,
 }
 
-#[derive(Debug, Serialize, FromRow, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct QueueStatusCount {
     pub status: String,
     pub count: i64,
 }
+crate::db::row!(QueueStatusCount { status, count });
 
-#[derive(Debug, Serialize, FromRow, ToSchema)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct ConsumerOffset {
     pub consumer: String,
     pub topic: String,
@@ -117,6 +141,13 @@ pub struct ConsumerOffset {
     pub next_offset: i64,
     pub updated_at: DateTime<Utc>,
 }
+crate::db::row!(ConsumerOffset {
+    consumer,
+    topic,
+    partition,
+    next_offset,
+    updated_at
+});
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QueueStats {
@@ -160,7 +191,8 @@ pub(crate) async fn admin_list_orders(
         return Ok((Cache::headers(true), Json(cached)));
     }
 
-    let total = sqlx::query_scalar::<_, i64>(
+    let total = crate::db::scalar_one::<i64>(
+        &state.pool.get().await?,
         r#"
         SELECT count(*)
         FROM neurovector.orders
@@ -175,16 +207,18 @@ pub(crate) async fn admin_list_orders(
           AND ($4::timestamptz IS NULL OR created_at >= $4)
           AND ($5::timestamptz IS NULL OR created_at < $5)
         "#,
+        &[
+            &(params.status.as_deref()),
+            &(params.phone.as_deref()),
+            &(params.q.as_deref()),
+            &(params.from),
+            &(params.to),
+        ],
     )
-    .bind(params.status.as_deref())
-    .bind(params.phone.as_deref())
-    .bind(params.q.as_deref())
-    .bind(params.from)
-    .bind(params.to)
-    .fetch_one(&state.pool)
     .await?;
 
-    let items = sqlx::query_as::<_, Order>(
+    let items = crate::db::fetch_all::<Order>(
+        &state.pool.get().await?,
         r#"
         SELECT id, order_number, customer_name, customer_phone, status, total_amount,
                currency, delivery_address, delivery_detail, latitude, longitude,
@@ -203,15 +237,16 @@ pub(crate) async fn admin_list_orders(
         ORDER BY created_at DESC
         LIMIT $6 OFFSET $7
         "#,
+        &[
+            &(params.status.as_deref()),
+            &(params.phone.as_deref()),
+            &(params.q.as_deref()),
+            &(params.from),
+            &(params.to),
+            &(limit),
+            &(offset),
+        ],
     )
-    .bind(params.status.as_deref())
-    .bind(params.phone.as_deref())
-    .bind(params.q.as_deref())
-    .bind(params.from)
-    .bind(params.to)
-    .bind(limit)
-    .bind(offset)
-    .fetch_all(&state.pool)
     .await?;
 
     let response = AdminOrderList {
@@ -242,8 +277,7 @@ pub(crate) async fn admin_order_stats(
         return Ok(Json(cached));
     }
 
-    let stats = sqlx::query_as::<_, AdminOrderStats>(
-        r#"
+    let stats = crate::db::fetch_one::<AdminOrderStats>(&state.pool.get().await?, r#"
         SELECT count(*) AS total_orders,
                count(*) FILTER (WHERE status = 'pending_payment') AS pending_payment,
                count(*) FILTER (WHERE status = 'paid') AS paid,
@@ -260,9 +294,7 @@ pub(crate) async fn admin_order_stats(
                ), 0)::bigint AS revenue,
                COALESCE(sum(total_amount) FILTER (WHERE status = 'delivered'), 0)::bigint AS delivered_revenue
         FROM neurovector.orders
-        "#,
-    )
-    .fetch_one(&state.pool)
+        "#, &[])
     .await?;
 
     if let Err(err) = state.cache.set(key, &stats).await {
@@ -285,7 +317,8 @@ pub(crate) async fn admin_list_jobs(
     Query(params): Query<ListJobsParams>,
 ) -> Result<Json<Vec<OrderJob>>, AppError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let jobs = sqlx::query_as::<_, OrderJob>(
+    let jobs = crate::db::fetch_all::<OrderJob>(
+        &state.pool.get().await?,
         r#"
         SELECT id, status, payload, attempts, max_attempts, order_id, last_error,
                created_at, updated_at, started_at, completed_at
@@ -294,10 +327,8 @@ pub(crate) async fn admin_list_jobs(
         ORDER BY created_at DESC
         LIMIT $2
         "#,
+        &[&(params.status.as_deref()), &(limit)],
     )
-    .bind(params.status.as_deref())
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
     Ok(Json(jobs))
 }
@@ -352,7 +383,8 @@ pub(crate) async fn admin_list_events(
     Query(params): Query<ListEventsParams>,
 ) -> Result<Json<Vec<OrderEvent>>, AppError> {
     let limit = params.limit.unwrap_or(100).clamp(1, 500);
-    let events = sqlx::query_as::<_, OrderEvent>(
+    let events = crate::db::fetch_all::<OrderEvent>(
+        &state.pool.get().await?,
         r#"
         SELECT event_id, event_type, order_id, job_id, payload, created_at
         FROM neurovector.order_events
@@ -361,11 +393,12 @@ pub(crate) async fn admin_list_events(
         ORDER BY created_at DESC
         LIMIT $3
         "#,
+        &[
+            &(params.order_id),
+            &(params.event_type.as_deref()),
+            &(limit),
+        ],
     )
-    .bind(params.order_id)
-    .bind(params.event_type.as_deref())
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
     Ok(Json(events))
 }
@@ -380,29 +413,34 @@ pub(crate) async fn admin_list_events(
 pub(crate) async fn admin_queue_stats(
     State(state): State<AppState>,
 ) -> Result<Json<QueueStats>, AppError> {
-    let jobs = sqlx::query_as::<_, QueueStatusCount>(
+    let jobs = crate::db::fetch_all::<QueueStatusCount>(
+        &state.pool.get().await?,
         r#"
         SELECT status, count(*) AS count
         FROM neurovector.order_jobs
         GROUP BY status
         ORDER BY status
         "#,
+        &[],
     )
-    .fetch_all(&state.pool)
     .await?;
 
-    let events = sqlx::query_scalar::<_, i64>("SELECT count(*) FROM neurovector.order_events")
-        .fetch_one(&state.pool)
-        .await?;
+    let events = crate::db::scalar_one::<i64>(
+        &state.pool.get().await?,
+        "SELECT count(*) FROM neurovector.order_events",
+        &[],
+    )
+    .await?;
 
-    let consumer_offsets = sqlx::query_as::<_, ConsumerOffset>(
+    let consumer_offsets = crate::db::fetch_all::<ConsumerOffset>(
+        &state.pool.get().await?,
         r#"
         SELECT consumer, topic, partition, next_offset, updated_at
         FROM neurovector.kafka_consumer_offsets
         ORDER BY consumer, topic, partition
         "#,
+        &[],
     )
-    .fetch_all(&state.pool)
     .await?;
 
     Ok(Json(QueueStats {

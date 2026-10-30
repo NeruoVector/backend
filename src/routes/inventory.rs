@@ -25,7 +25,7 @@ pub fn router(state: AppState) -> Router<AppState> {
         .merge(protected)
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone, sqlx::FromRow, ToSchema)]
+#[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
 pub struct InventoryItem {
     pub id: Uuid,
     pub sku: String,
@@ -38,6 +38,18 @@ pub struct InventoryItem {
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
+crate::db::row!(InventoryItem {
+    id,
+    sku,
+    name,
+    description,
+    unit_price,
+    currency,
+    stock_quantity,
+    active,
+    created_at,
+    updated_at
+});
 
 #[derive(Debug, Deserialize, IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -113,7 +125,8 @@ pub(crate) async fn list_items(
         return Ok((Cache::headers(true), Json(cached)));
     }
 
-    let items = sqlx::query_as::<_, InventoryItem>(
+    let items = crate::db::fetch_all::<InventoryItem>(
+        &state.pool.get().await?,
         r#"
         SELECT id, sku, name, description, unit_price, currency, stock_quantity,
                active, created_at, updated_at
@@ -122,10 +135,8 @@ pub(crate) async fn list_items(
         ORDER BY name ASC
         LIMIT $2
         "#,
+        &[&(params.active), &(limit)],
     )
-    .bind(params.active)
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
 
     if let Err(err) = state.cache.set(&key, &items).await {
@@ -185,7 +196,8 @@ pub(crate) async fn create_item(
     validate_price_and_stock(body.unit_price, body.stock_quantity.unwrap_or(0))?;
     let currency = normalize_currency(body.currency.as_deref().unwrap_or("KRW"))?;
 
-    let item = sqlx::query_as::<_, InventoryItem>(
+    let item = crate::db::fetch_one::<InventoryItem>(
+        &state.pool.get().await?,
         r#"
         INSERT INTO neurovector.inventory_items
             (sku, name, description, unit_price, currency, stock_quantity, active)
@@ -193,15 +205,16 @@ pub(crate) async fn create_item(
         RETURNING id, sku, name, description, unit_price, currency, stock_quantity,
                   active, created_at, updated_at
         "#,
+        &[
+            &(body.sku.trim()),
+            &(body.name.trim()),
+            &(body.description),
+            &(body.unit_price),
+            &(currency),
+            &(body.stock_quantity.unwrap_or(0)),
+            &(body.active),
+        ],
     )
-    .bind(body.sku.trim())
-    .bind(body.name.trim())
-    .bind(body.description)
-    .bind(body.unit_price)
-    .bind(currency)
-    .bind(body.stock_quantity.unwrap_or(0))
-    .bind(body.active)
-    .fetch_one(&state.pool)
     .await
     .map_err(map_inventory_error)?;
 
@@ -242,7 +255,8 @@ pub(crate) async fn update_item(
     }
     validate_price_and_stock(unit_price, stock_quantity)?;
 
-    let item = sqlx::query_as::<_, InventoryItem>(
+    let item = crate::db::fetch_one::<InventoryItem>(
+        &state.pool.get().await?,
         r#"
         UPDATE neurovector.inventory_items
         SET name = $2, description = $3, unit_price = $4, currency = $5,
@@ -251,15 +265,16 @@ pub(crate) async fn update_item(
         RETURNING id, sku, name, description, unit_price, currency, stock_quantity,
                   active, created_at, updated_at
         "#,
+        &[
+            &(id),
+            &(name.trim()),
+            &(description),
+            &(unit_price),
+            &(currency),
+            &(stock_quantity),
+            &(active),
+        ],
     )
-    .bind(id)
-    .bind(name.trim())
-    .bind(description)
-    .bind(unit_price)
-    .bind(currency)
-    .bind(stock_quantity)
-    .bind(active)
-    .fetch_one(&state.pool)
     .await?;
 
     invalidate_inventory_cache(&state).await;
@@ -287,7 +302,8 @@ pub(crate) async fn restock_item(
         return Err(AppError::BadRequest("quantity must be positive".into()));
     }
 
-    let item = sqlx::query_as::<_, InventoryItem>(
+    let item = crate::db::fetch_optional::<InventoryItem>(
+        &state.pool.get().await?,
         r#"
         UPDATE neurovector.inventory_items
         SET stock_quantity = stock_quantity + $2, updated_at = now()
@@ -295,10 +311,8 @@ pub(crate) async fn restock_item(
         RETURNING id, sku, name, description, unit_price, currency, stock_quantity,
                   active, created_at, updated_at
         "#,
+        &[&(id), &(body.quantity)],
     )
-    .bind(id)
-    .bind(body.quantity)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
@@ -307,16 +321,16 @@ pub(crate) async fn restock_item(
 }
 
 async fn fetch_item(state: &AppState, id: Uuid) -> Result<InventoryItem, AppError> {
-    sqlx::query_as::<_, InventoryItem>(
+    crate::db::fetch_optional::<InventoryItem>(
+        &state.pool.get().await?,
         r#"
         SELECT id, sku, name, description, unit_price, currency, stock_quantity,
                active, created_at, updated_at
         FROM neurovector.inventory_items
         WHERE id = $1
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)
 }
@@ -327,7 +341,10 @@ pub(crate) async fn invalidate_inventory_cache(state: &AppState) {
     }
 }
 
-fn validate_price_and_stock(unit_price: i64, stock_quantity: i32) -> Result<(), AppError> {
+pub(crate) fn validate_price_and_stock(
+    unit_price: i64,
+    stock_quantity: i32,
+) -> Result<(), AppError> {
     if unit_price < 0 {
         return Err(AppError::BadRequest("unit_price must be >= 0".into()));
     }
@@ -337,7 +354,7 @@ fn validate_price_and_stock(unit_price: i64, stock_quantity: i32) -> Result<(), 
     Ok(())
 }
 
-fn normalize_currency(currency: &str) -> Result<String, AppError> {
+pub(crate) fn normalize_currency(currency: &str) -> Result<String, AppError> {
     let currency = currency.trim().to_ascii_uppercase();
     if currency.len() != 3 || !currency.chars().all(|c| c.is_ascii_alphabetic()) {
         return Err(AppError::BadRequest(
@@ -347,9 +364,9 @@ fn normalize_currency(currency: &str) -> Result<String, AppError> {
     Ok(currency)
 }
 
-fn map_inventory_error(err: sqlx::Error) -> AppError {
-    if let sqlx::Error::Database(ref database_error) = err
-        && database_error.is_unique_violation()
+pub(crate) fn map_inventory_error(err: tokio_postgres::Error) -> AppError {
+    if let Some(database_error) = err.as_db_error()
+        && database_error.code() == &tokio_postgres::error::SqlState::UNIQUE_VIOLATION
     {
         return AppError::Conflict("sku already exists".into());
     }

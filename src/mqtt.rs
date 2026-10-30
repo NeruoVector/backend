@@ -213,22 +213,28 @@ async fn handle_publish(state: &AppState, config: &MqttConfig, topic: &str, payl
     }
 }
 
-async fn handle_status(state: &AppState, drone_id: &str, payload: &[u8]) {
-    #[derive(Deserialize)]
-    struct StatusPayload {
-        #[serde(default)]
-        online: Option<bool>,
-        #[serde(default)]
-        status: Option<String>,
-    }
+#[derive(Deserialize)]
+struct StatusPayload {
+    online: bool,
+    #[serde(default)]
+    status: Option<String>,
+}
 
-    let payload = serde_json::from_slice::<StatusPayload>(payload).unwrap_or(StatusPayload {
-        online: Some(false),
-        status: None,
-    });
-    let online = payload.online.unwrap_or(true);
+async fn handle_status(state: &AppState, drone_id: &str, payload: &[u8]) {
+    let payload = match serde_json::from_slice::<StatusPayload>(payload) {
+        Ok(payload) => payload,
+        Err(err) => {
+            tracing::warn!(error = %err, drone_id, "invalid MQTT status payload");
+            return;
+        }
+    };
+    let online = payload.online;
     let key = format!("neurovector:drone:{drone_id}:online");
-    let ttl = if online { 120 } else { 3600 };
+    let ttl = if online {
+        state.telemetry_online_ttl_seconds
+    } else {
+        3600
+    };
     let value = serde_json::json!({
         "online": online,
         "status": payload.status,
@@ -269,4 +275,27 @@ struct DetectionPayload {
     #[serde(default)]
     priority_level: Option<i16>,
     detected_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod status_payload_tests {
+    use super::StatusPayload;
+
+    #[test]
+    fn status_requires_boolean_online() {
+        for invalid in [
+            "not-json",
+            "{}",
+            "{\"online\":null}",
+            "{\"online\":\"true\"}",
+        ] {
+            assert!(serde_json::from_str::<StatusPayload>(invalid).is_err());
+        }
+        for valid in [
+            "{\"online\":true,\"status\":\"ready\"}",
+            "{\"online\":false}",
+        ] {
+            assert!(serde_json::from_str::<StatusPayload>(valid).is_ok());
+        }
+    }
 }

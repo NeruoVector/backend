@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db::PgPool;
 use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use rskafka::client::{
@@ -10,7 +11,6 @@ use rskafka::client::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -45,7 +45,7 @@ pub enum OrderQueueMessage {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrderJob {
     pub id: Uuid,
     pub status: String,
@@ -60,8 +60,21 @@ pub struct OrderJob {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
 }
+crate::db::row!(OrderJob {
+    id,
+    status,
+    payload,
+    attempts,
+    max_attempts,
+    order_id,
+    last_error,
+    created_at,
+    updated_at,
+    started_at,
+    completed_at
+});
 
-#[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct OrderEvent {
     pub event_id: Uuid,
     pub event_type: String,
@@ -71,6 +84,14 @@ pub struct OrderEvent {
     pub payload: Value,
     pub created_at: DateTime<Utc>,
 }
+crate::db::row!(OrderEvent {
+    event_id,
+    event_type,
+    order_id,
+    job_id,
+    payload,
+    created_at
+});
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnqueueOrderResponse {
@@ -86,18 +107,24 @@ pub async fn enqueue_create_order(
     body: CreateOrder,
 ) -> Result<EnqueueOrderResponse, AppError> {
     orders::validate_create_order(&body)?;
+    if body.handoff_pin.is_some() || body.spot_id.is_some() {
+        return Err(AppError::BadRequest(
+            "customer handoff and saved spot checkout requires the synchronous orders endpoint"
+                .into(),
+        ));
+    }
     let payload = serde_json::to_value(&body).map_err(anyhow::Error::from)?;
 
-    let job = sqlx::query_as::<_, OrderJob>(
+    let job = crate::db::fetch_one::<OrderJob>(
+        &state.pool.get().await?,
         r#"
         INSERT INTO neurovector.order_jobs (payload)
         VALUES ($1)
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
                   created_at, updated_at, started_at, completed_at
         "#,
+        &[&(payload)],
     )
-    .bind(payload)
-    .fetch_one(&state.pool)
     .await?;
 
     let kafka_published = publish_create_job(state, job.id).await;
@@ -122,12 +149,8 @@ async fn publish_create_job(state: &AppState, job_id: Uuid) -> bool {
     .await
     {
         Ok(Ok(())) => {
-            if let Err(err) = sqlx::query(
-                "UPDATE neurovector.order_jobs SET updated_at = now() WHERE id = $1 AND status = 'queued'",
-            )
-            .bind(job_id)
-            .execute(&state.pool)
-            .await
+            if let Err(err) = async { crate::db::execute(&state.pool.get().await?, "UPDATE neurovector.order_jobs SET updated_at = now() WHERE id = $1 AND status = 'queued'", &[&(job_id)])
+            .await?; Ok::<(), AppError>(()) }.await
             {
                 tracing::warn!(error = %err, %job_id, "failed to mark order job as published");
             }
@@ -158,20 +181,26 @@ pub async fn publish_order_event(
 ) {
     let event_id = Uuid::new_v4();
 
-    if let Err(err) = sqlx::query(
-        r#"
+    if let Err(err) = async {
+        crate::db::execute(
+            &state.pool.get().await?,
+            r#"
         INSERT INTO neurovector.order_events
             (event_id, event_type, order_id, job_id, payload)
         VALUES ($1, $2, $3, $4, $5)
         ON CONFLICT (event_id) DO NOTHING
         "#,
-    )
-    .bind(event_id)
-    .bind(event_type)
-    .bind(order_id)
-    .bind(job_id)
-    .bind(&payload)
-    .execute(&state.pool)
+            &[
+                &(event_id),
+                &(event_type),
+                &(order_id),
+                &(job_id),
+                &(&payload),
+            ],
+        )
+        .await?;
+        Ok::<(), AppError>(())
+    }
     .await
     {
         tracing::warn!(error = %err, %order_id, event_type, "failed to persist order event");
@@ -208,23 +237,24 @@ pub async fn publish_order_event(
 }
 
 pub async fn get_job(pool: &PgPool, id: Uuid) -> Result<OrderJob, AppError> {
-    sqlx::query_as::<_, OrderJob>(
+    crate::db::fetch_optional::<OrderJob>(
+        &pool.get().await?,
         r#"
         SELECT id, status, payload, attempts, max_attempts, order_id, last_error,
                created_at, updated_at, started_at, completed_at
         FROM neurovector.order_jobs
         WHERE id = $1
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(pool)
     .await?
     .ok_or(AppError::NotFound)
 }
 
 /// 실패/대기 상태의 job 을 다시 queued 로 만들고 Kafka 로 재발행한다.
 pub async fn retry_job(state: &AppState, id: Uuid) -> Result<EnqueueOrderResponse, AppError> {
-    let job = sqlx::query_as::<_, OrderJob>(
+    let job = crate::db::fetch_optional::<OrderJob>(
+        &state.pool.get().await?,
         r#"
         UPDATE neurovector.order_jobs
         SET status = 'queued',
@@ -236,9 +266,8 @@ pub async fn retry_job(state: &AppState, id: Uuid) -> Result<EnqueueOrderRespons
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
                   created_at, updated_at, started_at, completed_at
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| {
         AppError::Conflict("only queued, failed, dead or cancelled jobs can be retried".into())
@@ -252,7 +281,8 @@ pub async fn retry_job(state: &AppState, id: Uuid) -> Result<EnqueueOrderRespons
 }
 
 pub async fn cancel_job(state: &AppState, id: Uuid) -> Result<OrderJob, AppError> {
-    sqlx::query_as::<_, OrderJob>(
+    crate::db::fetch_optional::<OrderJob>(
+        &state.pool.get().await?,
         r#"
         UPDATE neurovector.order_jobs
         SET status = 'cancelled',
@@ -262,9 +292,8 @@ pub async fn cancel_job(state: &AppState, id: Uuid) -> Result<OrderJob, AppError
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
                   created_at, updated_at, started_at, completed_at
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or_else(|| AppError::Conflict("only queued, failed or dead jobs can be cancelled".into()))
 }
@@ -302,7 +331,8 @@ pub fn spawn_worker(state: AppState, config: &Config) {
 /// Kafka 발행에 실패했거나 브로커가 늦게 뜬 경우를 대비해 오래된 queued job 을
 /// 주기적으로 다시 발행한다. 중복 메시지는 worker 의 원자적 claim 으로 무시된다.
 async fn republish_queued_jobs(state: &AppState) -> anyhow::Result<()> {
-    let job_ids = sqlx::query_scalar::<_, Uuid>(
+    let job_ids = crate::db::scalar_all::<Uuid>(
+        &state.pool.get().await?,
         r#"
         SELECT id
         FROM neurovector.order_jobs
@@ -311,8 +341,8 @@ async fn republish_queued_jobs(state: &AppState) -> anyhow::Result<()> {
         ORDER BY created_at ASC
         LIMIT 50
         "#,
+        &[],
     )
-    .fetch_all(&state.pool)
     .await?;
 
     for job_id in job_ids {
@@ -412,20 +442,22 @@ async fn handle_message(state: &AppState, message: OrderQueueMessage) -> anyhow:
             job_id,
             payload,
         } => {
-            sqlx::query(
+            crate::db::execute(
+                &state.pool.get().await?,
                 r#"
                 INSERT INTO neurovector.order_events
                     (event_id, event_type, order_id, job_id, payload)
                 VALUES ($1, $2, $3, $4, $5)
                 ON CONFLICT (event_id) DO NOTHING
                 "#,
+                &[
+                    &(event_id),
+                    &(&event_type),
+                    &(order_id),
+                    &(job_id),
+                    &(&payload),
+                ],
             )
-            .bind(event_id)
-            .bind(&event_type)
-            .bind(order_id)
-            .bind(job_id)
-            .bind(&payload)
-            .execute(&state.pool)
             .await?;
         }
     }
@@ -450,12 +482,25 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
         fail_job(&state.pool, job_id, err.to_string()).await?;
         return Ok(());
     }
+    if body.handoff_pin.is_some() || body.spot_id.is_some() {
+        fail_job(
+            &state.pool,
+            job_id,
+            "customer handoff and saved spot checkout requires synchronous checkout".into(),
+        )
+        .await?;
+        return Ok(());
+    }
 
-    let mut tx = state.pool.begin().await?;
+    let mut connection = state.pool.get().await?;
+    let mut tx = connection.transaction().await?;
     let detail = match orders::create_order_in_tx(&mut tx, &body).await {
         Ok(detail) => detail,
         Err(err) => {
-            tx.rollback().await.ok();
+            if let Err(rollback_error) = tx.rollback().await {
+                tracing::warn!(%rollback_error, "order job rollback failed");
+            }
+            drop(connection);
             fail_job(&state.pool, job_id, err.to_string()).await?;
             return Ok(());
         }
@@ -463,24 +508,28 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
 
     // 주문 생성과 job 완료를 같은 트랜잭션으로 커밋한다. 그래야 커밋 직후
     // 프로세스가 죽어도 주문만 생성되고 job 이 processing 에 남는 일이 없다.
-    if let Err(err) = sqlx::query(
+    if let Err(err) = crate::db::execute(
+        &tx,
         r#"
         UPDATE neurovector.order_jobs
         SET status = 'completed', order_id = $2, completed_at = now(), updated_at = now()
         WHERE id = $1 AND status = 'processing'
         "#,
+        &[&(job_id), &(detail.order.id)],
     )
-    .bind(job_id)
-    .bind(detail.order.id)
-    .execute(&mut *tx)
     .await
     {
-        tx.rollback().await.ok();
+        if let Err(rollback_error) = tx.rollback().await {
+            tracing::warn!(%rollback_error, "order job rollback failed");
+        }
+        drop(connection);
         fail_job(&state.pool, job_id, err.to_string()).await?;
         return Ok(());
     }
 
-    if let Err(err) = tx.commit().await {
+    let committed = tx.commit().await;
+    drop(connection);
+    if let Err(err) = committed {
         fail_job(&state.pool, job_id, err.to_string()).await?;
         return Ok(());
     }
@@ -507,7 +556,8 @@ async fn process_create_order_job(state: &AppState, job_id: Uuid) -> anyhow::Res
 }
 
 async fn claim_job(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<OrderJob>> {
-    let job = sqlx::query_as::<_, OrderJob>(
+    let job = crate::db::fetch_optional::<OrderJob>(
+        &pool.get().await?,
         r#"
         UPDATE neurovector.order_jobs
         SET status = 'processing',
@@ -519,16 +569,16 @@ async fn claim_job(pool: &PgPool, id: Uuid) -> anyhow::Result<Option<OrderJob>> 
         RETURNING id, status, payload, attempts, max_attempts, order_id, last_error,
                   created_at, updated_at, started_at, completed_at
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(pool)
     .await?;
 
     Ok(job)
 }
 
 async fn fail_job(pool: &PgPool, id: Uuid, error: String) -> anyhow::Result<()> {
-    sqlx::query(
+    crate::db::execute(
+        &pool.get().await?,
         r#"
         UPDATE neurovector.order_jobs
         SET status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'failed' END,
@@ -537,16 +587,15 @@ async fn fail_job(pool: &PgPool, id: Uuid, error: String) -> anyhow::Result<()> 
             updated_at = now()
         WHERE id = $1
         "#,
+        &[&(id), &(error)],
     )
-    .bind(id)
-    .bind(error)
-    .execute(pool)
     .await?;
     Ok(())
 }
 
 async fn recover_stale_jobs(pool: &PgPool) -> anyhow::Result<()> {
-    let result = sqlx::query(
+    let result = crate::db::execute(
+        &pool.get().await?,
         r#"
         UPDATE neurovector.order_jobs
         SET status = 'failed',
@@ -555,28 +604,26 @@ async fn recover_stale_jobs(pool: &PgPool) -> anyhow::Result<()> {
         WHERE status = 'processing'
           AND started_at < now() - make_interval(mins => $1)
         "#,
+        &[&(STALE_JOB_MINUTES as i32)],
     )
-    .bind(STALE_JOB_MINUTES as i32)
-    .execute(pool)
     .await?;
 
-    if result.rows_affected() > 0 {
-        tracing::warn!(count = result.rows_affected(), "recovered stale order jobs");
+    if result > 0 {
+        tracing::warn!(count = result, "recovered stale order jobs");
     }
     Ok(())
 }
 
 async fn load_offset(pool: &PgPool, topic: &str) -> anyhow::Result<i64> {
-    let offset = sqlx::query_scalar::<_, i64>(
+    let offset = crate::db::scalar_optional::<i64>(
+        &pool.get().await?,
         r#"
         SELECT next_offset
         FROM neurovector.kafka_consumer_offsets
         WHERE consumer = $1 AND topic = $2 AND partition = 0
         "#,
+        &[&(WORKER_NAME), &(topic)],
     )
-    .bind(WORKER_NAME)
-    .bind(topic)
-    .fetch_optional(pool)
     .await?
     .unwrap_or(0);
 
@@ -584,7 +631,8 @@ async fn load_offset(pool: &PgPool, topic: &str) -> anyhow::Result<i64> {
 }
 
 async fn save_offset(pool: &PgPool, topic: &str, next_offset: i64) -> anyhow::Result<()> {
-    sqlx::query(
+    crate::db::execute(
+        &pool.get().await?,
         r#"
         INSERT INTO neurovector.kafka_consumer_offsets
             (consumer, topic, partition, next_offset, updated_at)
@@ -592,11 +640,8 @@ async fn save_offset(pool: &PgPool, topic: &str, next_offset: i64) -> anyhow::Re
         ON CONFLICT (consumer, topic, partition)
         DO UPDATE SET next_offset = EXCLUDED.next_offset, updated_at = now()
         "#,
+        &[&(WORKER_NAME), &(topic), &(next_offset)],
     )
-    .bind(WORKER_NAME)
-    .bind(topic)
-    .bind(next_offset)
-    .execute(pool)
     .await?;
     Ok(())
 }
@@ -605,33 +650,28 @@ async fn save_offset(pool: &PgPool, topic: &str, next_offset: i64) -> anyhow::Re
 mod tests {
     use super::*;
     use crate::state::test_state;
-    use sqlx::postgres::PgPoolOptions;
 
     #[tokio::test]
-    async fn processes_create_order_job_idempotently() {
+    async fn processes_create_order_job_idempotently() -> anyhow::Result<()> {
         let Ok(database_url) = std::env::var("TEST_DATABASE_URL") else {
             eprintln!("TEST_DATABASE_URL not set; skipping PostgreSQL queue integration test");
-            return;
+            return Ok(());
         };
 
-        let pool = PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .expect("connect test database");
+        let pool = crate::db::pool(&database_url, 2).expect("connect test database");
         let state = test_state(pool.clone());
 
         let sku = format!("QUEUE-TEST-{}", Uuid::new_v4());
-        let item_id = sqlx::query_scalar::<_, Uuid>(
+        let item_id = crate::db::scalar_one::<Uuid>(
+            &pool.get().await?,
             r#"
             INSERT INTO neurovector.inventory_items
                 (sku, name, unit_price, currency, stock_quantity)
             VALUES ($1, 'Queue Test Item', 1000, 'KRW', 3)
             RETURNING id
             "#,
+            &[&(&sku)],
         )
-        .bind(&sku)
-        .fetch_one(&pool)
         .await
         .expect("insert inventory item");
 
@@ -648,13 +688,18 @@ mod tests {
             longitude: None,
             notes: None,
             delivery_id: None,
+            spot_id: None,
+            room_number: None,
+            grade: None,
+            classroom: None,
+            handoff_pin: None,
         };
         let payload = serde_json::to_value(&body).expect("serialize order payload");
-        let job_id = sqlx::query_scalar::<_, Uuid>(
+        let job_id = crate::db::scalar_one::<Uuid>(
+            &pool.get().await?,
             "INSERT INTO neurovector.order_jobs (payload) VALUES ($1) RETURNING id",
+            &[&(payload)],
         )
-        .bind(payload)
-        .fetch_one(&pool)
         .await
         .expect("insert order job");
 
@@ -670,39 +715,36 @@ mod tests {
             .await
             .expect("reprocess job is a no-op");
 
-        let (status, order_id, attempts) = sqlx::query_as::<_, (String, Option<Uuid>, i32)>(
+        let (status, order_id, attempts) = crate::db::fetch_one::<(String, Option<Uuid>, i32)>(
+            &pool.get().await?,
             "SELECT status, order_id, attempts FROM neurovector.order_jobs WHERE id = $1",
+            &[&(job_id)],
         )
-        .bind(job_id)
-        .fetch_one(&pool)
         .await
         .expect("fetch job");
         assert_eq!(status, "completed");
         assert_eq!(attempts, 1);
         let order_id = order_id.expect("job has order id");
 
-        let stock = sqlx::query_scalar::<_, i32>(
+        let stock = crate::db::scalar_one::<i32>(
+            &pool.get().await?,
             "SELECT stock_quantity FROM neurovector.inventory_items WHERE id = $1",
+            &[&(item_id)],
         )
-        .bind(item_id)
-        .fetch_one(&pool)
         .await
         .expect("fetch stock");
         assert_eq!(stock, 1);
 
-        let order_count =
-            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM neurovector.orders WHERE id = $1")
-                .bind(order_id)
-                .fetch_one(&pool)
-                .await
-                .expect("count order");
+        let order_count = crate::db::scalar_one::<i64>(
+            &pool.get().await?,
+            "SELECT count(*) FROM neurovector.orders WHERE id = $1",
+            &[&(order_id)],
+        )
+        .await
+        .expect("count order");
         assert_eq!(order_count, 1);
 
-        let event_count = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM neurovector.order_events WHERE order_id = $1 AND event_type = 'order.created'",
-        )
-        .bind(order_id)
-        .fetch_one(&pool)
+        let event_count = crate::db::scalar_one::<i64>(&pool.get().await?, "SELECT count(*) FROM neurovector.order_events WHERE order_id = $1 AND event_type = 'order.created'", &[&(order_id)])
         .await
         .expect("count events");
         assert_eq!(event_count, 1);
@@ -721,35 +763,44 @@ mod tests {
         handle_message(&state, event_message)
             .await
             .expect("replayed event is a no-op");
-        let event_count = sqlx::query_scalar::<_, i64>(
+        let event_count = crate::db::scalar_one::<i64>(
+            &pool.get().await?,
             "SELECT count(*) FROM neurovector.order_events WHERE event_id = $1",
+            &[&(event_id)],
         )
-        .bind(event_id)
-        .fetch_one(&pool)
         .await
         .expect("count test event");
         assert_eq!(event_count, 1);
 
         // 테스트 데이터 정리
-        sqlx::query("DELETE FROM neurovector.order_events WHERE order_id = $1")
-            .bind(order_id)
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM neurovector.order_jobs WHERE id = $1")
-            .bind(job_id)
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM neurovector.orders WHERE id = $1")
-            .bind(order_id)
-            .execute(&pool)
-            .await
-            .ok();
-        sqlx::query("DELETE FROM neurovector.inventory_items WHERE id = $1")
-            .bind(item_id)
-            .execute(&pool)
-            .await
-            .ok();
+        crate::db::execute(
+            &pool.get().await?,
+            "DELETE FROM neurovector.order_events WHERE order_id = $1",
+            &[&(order_id)],
+        )
+        .await
+        .ok();
+        crate::db::execute(
+            &pool.get().await?,
+            "DELETE FROM neurovector.order_jobs WHERE id = $1",
+            &[&(job_id)],
+        )
+        .await
+        .ok();
+        crate::db::execute(
+            &pool.get().await?,
+            "DELETE FROM neurovector.orders WHERE id = $1",
+            &[&(order_id)],
+        )
+        .await
+        .ok();
+        crate::db::execute(
+            &pool.get().await?,
+            "DELETE FROM neurovector.inventory_items WHERE id = $1",
+            &[&(item_id)],
+        )
+        .await
+        .ok();
+        Ok(())
     }
 }

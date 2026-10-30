@@ -44,10 +44,12 @@ pub struct DroneStatus {
     pub delivery_id: Option<Uuid>,
 }
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug)]
 struct StatusRow {
     drone_id: String,
     last_seen: DateTime<Utc>,
+    received_at: DateTime<Utc>,
+    eligible_at_receipt: bool,
     latitude: Option<f64>,
     longitude: Option<f64>,
     altitude_m: Option<f64>,
@@ -59,13 +61,32 @@ struct StatusRow {
     flight_status: Option<String>,
     delivery_id: Option<Uuid>,
 }
+crate::db::row!(StatusRow {
+    drone_id,
+    last_seen,
+    received_at,
+    eligible_at_receipt,
+    latitude,
+    longitude,
+    altitude_m,
+    speed_mps,
+    battery_pct,
+    heading_deg,
+    status,
+    flight_id,
+    flight_status,
+    delivery_id
+});
 
 impl StatusRow {
     fn into_status(self, ttl_seconds: u64) -> DroneStatus {
-        let stale_for_seconds = (Utc::now() - self.last_seen).num_seconds().max(0);
+        let now = Utc::now();
+        let (device_online, device_age) = telemetry_age(self.last_seen, now, ttl_seconds);
+        let (receipt_online, receipt_age) = telemetry_age(self.received_at, now, ttl_seconds);
+        let stale_for_seconds = device_age.max(receipt_age);
         DroneStatus {
             drone_id: self.drone_id,
-            online: stale_for_seconds <= ttl_seconds as i64,
+            online: self.eligible_at_receipt && device_online && receipt_online,
             last_seen: self.last_seen,
             stale_for_seconds,
             latitude: self.latitude,
@@ -80,6 +101,16 @@ impl StatusRow {
             delivery_id: self.delivery_id,
         }
     }
+}
+
+const MAX_TELEMETRY_FUTURE_SKEW_SECONDS: i64 = 5;
+
+fn telemetry_age(at: DateTime<Utc>, now: DateTime<Utc>, ttl_seconds: u64) -> (bool, i64) {
+    let age = now.signed_duration_since(at);
+    let ttl_seconds = ttl_seconds.min(i64::MAX as u64) as i64;
+    let online = age >= chrono::Duration::seconds(-MAX_TELEMETRY_FUTURE_SKEW_SECONDS)
+        && age <= chrono::Duration::seconds(ttl_seconds);
+    (online, age.num_seconds().max(0))
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,19 +164,24 @@ pub struct FlightAnomaly {
 }
 
 async fn list_status(State(state): State<AppState>) -> Result<Json<Vec<DroneStatus>>, AppError> {
-    let rows = sqlx::query_as::<_, StatusRow>(
+    let rows = crate::db::fetch_all::<StatusRow>(
+        &state.pool.get().await?,
         r#"
         SELECT DISTINCT ON (t.drone_id)
-               t.drone_id, t.ts AS last_seen, t.latitude, t.longitude, t.altitude_m,
+               t.drone_id, t.ts AS last_seen, t.received_at,
+               t.accepted_for_current_state AS eligible_at_receipt,
+               t.latitude, t.longitude, t.altitude_m,
                t.speed_mps, t.battery_pct, t.heading_deg, t.status,
                fs.id AS flight_id, fs.status AS flight_status, fs.delivery_id
         FROM neurovector.telemetry t
         LEFT JOIN neurovector.flight_sessions fs
                ON fs.drone_id = t.drone_id AND fs.ended_at IS NULL
-        ORDER BY t.drone_id, t.ts DESC
+        ORDER BY t.drone_id,
+                 t.accepted_for_current_state DESC,
+                 t.ts DESC, t.id ASC
         "#,
+        &[],
     )
-    .fetch_all(&state.pool)
     .await?;
 
     let statuses = rows
@@ -159,21 +195,24 @@ async fn get_status(
     State(state): State<AppState>,
     Path(drone_id): Path<String>,
 ) -> Result<Json<DroneStatus>, AppError> {
-    let row = sqlx::query_as::<_, StatusRow>(
+    let row = crate::db::fetch_optional::<StatusRow>(
+        &state.pool.get().await?,
         r#"
-        SELECT t.drone_id, t.ts AS last_seen, t.latitude, t.longitude, t.altitude_m,
+        SELECT t.drone_id, t.ts AS last_seen, t.received_at,
+               t.accepted_for_current_state AS eligible_at_receipt,
+               t.latitude, t.longitude, t.altitude_m,
                t.speed_mps, t.battery_pct, t.heading_deg, t.status,
                fs.id AS flight_id, fs.status AS flight_status, fs.delivery_id
         FROM neurovector.telemetry t
         LEFT JOIN neurovector.flight_sessions fs
                ON fs.drone_id = t.drone_id AND fs.ended_at IS NULL
         WHERE t.drone_id = $1
-        ORDER BY t.ts DESC
+        ORDER BY t.accepted_for_current_state DESC,
+                 t.ts DESC, t.id ASC
         LIMIT 1
         "#,
+        &[&(&drone_id)],
     )
-    .bind(&drone_id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
@@ -185,7 +224,8 @@ async fn list_flights(
     Query(params): Query<ListFlightsParams>,
 ) -> Result<Json<Vec<FlightSession>>, AppError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
-    let flights = sqlx::query_as::<_, FlightSession>(
+    let flights = crate::db::fetch_all::<FlightSession>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, delivery_id, status, started_at, ended_at, created_at
         FROM neurovector.flight_sessions
@@ -194,11 +234,12 @@ async fn list_flights(
         ORDER BY started_at DESC
         LIMIT $3
         "#,
+        &[
+            &(params.drone_id.as_deref()),
+            &(params.status.as_deref()),
+            &(limit),
+        ],
     )
-    .bind(params.drone_id.as_deref())
-    .bind(params.status.as_deref())
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
 
     Ok(Json(flights))
@@ -208,15 +249,15 @@ async fn get_flight(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<FlightSession>, AppError> {
-    let flight = sqlx::query_as::<_, FlightSession>(
+    let flight = crate::db::fetch_optional::<FlightSession>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, delivery_id, status, started_at, ended_at, created_at
         FROM neurovector.flight_sessions
         WHERE id = $1
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
@@ -229,7 +270,8 @@ async fn list_flight_telemetry(
     Query(params): Query<ListTelemetryParams>,
 ) -> Result<Json<Vec<Telemetry>>, AppError> {
     let limit = params.limit.unwrap_or(500).clamp(1, 5_000);
-    let rows = sqlx::query_as::<_, Telemetry>(
+    let rows = crate::db::fetch_all::<Telemetry>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, flight_id, ts, latitude, longitude, altitude_m, speed_mps,
                vertical_speed_mps, battery_pct, heading_deg, status, received_at
@@ -238,10 +280,8 @@ async fn list_flight_telemetry(
         ORDER BY ts ASC
         LIMIT $2
         "#,
+        &[&(id), &(limit)],
     )
-    .bind(id)
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
 
     Ok(Json(rows))
@@ -268,17 +308,16 @@ async fn end_flight(
         ));
     }
 
-    let flight = sqlx::query_as::<_, FlightSession>(
+    let flight = crate::db::fetch_optional::<FlightSession>(
+        &state.pool.get().await?,
         r#"
         UPDATE neurovector.flight_sessions
         SET status = $2, ended_at = COALESCE(ended_at, now())
         WHERE id = $1
         RETURNING id, drone_id, delivery_id, status, started_at, ended_at, created_at
         "#,
+        &[&(id), &(status)],
     )
-    .bind(id)
-    .bind(status)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
@@ -289,19 +328,20 @@ async fn analyze_flight(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<FlightAnalysis>, AppError> {
-    let flight = sqlx::query_as::<_, FlightSession>(
+    let flight = crate::db::fetch_optional::<FlightSession>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, delivery_id, status, started_at, ended_at, created_at
         FROM neurovector.flight_sessions
         WHERE id = $1
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
-    let telemetry = sqlx::query_as::<_, Telemetry>(
+    let telemetry = crate::db::fetch_all::<Telemetry>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, flight_id, ts, latitude, longitude, altitude_m, speed_mps,
                vertical_speed_mps, battery_pct, heading_deg, status, received_at
@@ -309,9 +349,8 @@ async fn analyze_flight(
         WHERE flight_id = $1
         ORDER BY ts ASC
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_all(&state.pool)
     .await?;
 
     let mut anomalies = Vec::new();
@@ -453,4 +492,31 @@ async fn analyze_flight(
         anomalies,
         summary,
     }))
+}
+
+#[cfg(test)]
+mod status_tests {
+    use chrono::{Duration, Utc};
+
+    use super::telemetry_age;
+
+    #[test]
+    fn recent_device_and_receive_timestamps_are_online() {
+        let now = Utc::now();
+        assert!(telemetry_age(now - Duration::seconds(1), now, 120).0);
+    }
+
+    #[test]
+    fn future_timestamp_beyond_clock_skew_is_offline() {
+        let now = Utc::now();
+        assert!(!telemetry_age(now + Duration::hours(1), now, 120).0);
+    }
+
+    #[test]
+    fn small_clock_skew_is_tolerated_but_old_receive_time_is_offline() {
+        let now = Utc::now();
+        assert!(telemetry_age(now + Duration::seconds(3), now, 120).0);
+        assert!(!telemetry_age(now + Duration::milliseconds(5_500), now, 120).0);
+        assert!(!telemetry_age(now - Duration::seconds(121), now, 120).0);
+    }
 }

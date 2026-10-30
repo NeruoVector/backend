@@ -34,7 +34,8 @@ async fn list_detections(
 ) -> Result<Json<Vec<Detection>>, AppError> {
     let limit = params.limit.unwrap_or(50).clamp(1, 200);
 
-    let rows = sqlx::query_as::<_, Detection>(
+    let rows = crate::db::fetch_all::<Detection>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
                priority_level, detected_at, created_at
@@ -42,9 +43,8 @@ async fn list_detections(
         ORDER BY detected_at DESC
         LIMIT $1
         "#,
+        &[&(limit)],
     )
-    .bind(limit)
-    .fetch_all(&state.pool)
     .await?;
 
     Ok(Json(rows))
@@ -64,16 +64,16 @@ async fn get_detection(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Detection>, AppError> {
-    let detection = sqlx::query_as::<_, Detection>(
+    let detection = crate::db::fetch_optional::<Detection>(
+        &state.pool.get().await?,
         r#"
         SELECT id, drone_id, label, confidence, latitude, longitude, distance_m,
                priority_level, detected_at, created_at
         FROM neurovector.detections
         WHERE id = $1
         "#,
+        &[&(id)],
     )
-    .bind(id)
-    .fetch_optional(&state.pool)
     .await?
     .ok_or(AppError::NotFound)?;
 
