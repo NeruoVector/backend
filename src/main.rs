@@ -17,6 +17,7 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 mod auth;
 mod cache;
 mod config;
+mod customer_auth;
 mod db;
 mod docs;
 mod error;
@@ -104,19 +105,28 @@ async fn main() -> anyhow::Result<()> {
     mqtt::spawn(state.clone(), &config);
     order_queue::spawn_worker(state.clone(), &config);
 
-    let cors_origins = config
+    let cors_origin = if config
         .cors_allowed_origins
         .iter()
-        .filter_map(|origin| match origin.parse::<HeaderValue>() {
-            Ok(value) => Some(value),
-            Err(err) => {
-                tracing::warn!(origin, error = %err, "ignoring invalid CORS origin");
-                None
-            }
-        })
-        .collect::<Vec<_>>();
+        .any(|origin| origin == "*")
+    {
+        AllowOrigin::mirror_request()
+    } else {
+        let cors_origins = config
+            .cors_allowed_origins
+            .iter()
+            .filter_map(|origin| match origin.parse::<HeaderValue>() {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    tracing::warn!(origin, error = %err, "ignoring invalid CORS origin");
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        AllowOrigin::list(cors_origins)
+    };
     let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::list(cors_origins))
+        .allow_origin(cors_origin)
         .allow_credentials(true)
         .allow_methods(AllowMethods::mirror_request())
         .allow_headers(AllowHeaders::mirror_request());

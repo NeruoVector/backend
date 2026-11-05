@@ -22,7 +22,7 @@ pub struct SrtUrls {
     pub webrtc_whep_path: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct Recording {
     pub drone_id: String,
     pub name: String,

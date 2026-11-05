@@ -82,6 +82,7 @@ pub struct OrderDetail {
     pub order: Order,
     pub items: Vec<OrderItem>,
     pub payment: Option<Payment>,
+    pub pickup_code: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, ToSchema)]
@@ -173,7 +174,7 @@ pub(crate) async fn list_orders(
                currency, delivery_address, delivery_detail, latitude, longitude,
                notes, delivery_id, stock_restored_at, created_at, updated_at
         FROM neurovector.orders
-        WHERE ($1::text IS NULL OR status = $1)
+        WHERE customer_user_id IS NULL AND ($1::text IS NULL OR status = $1)
           AND ($2::text IS NULL OR customer_phone = $2)
         ORDER BY created_at DESC
         LIMIT $3
@@ -215,7 +216,13 @@ pub(crate) async fn get_order(
     let order = fetch_order(&state, id).await?;
     let items = fetch_order_items(&state, id).await?;
     let payment = fetch_latest_payment(&state, id).await?;
+    let pickup_code =
+        sqlx::query_scalar::<_, String>("SELECT pickup_code FROM neurovector.orders WHERE id=$1")
+            .bind(id)
+            .fetch_one(&state.pool)
+            .await?;
     let detail = OrderDetail {
+        pickup_code,
         order,
         items,
         payment,
@@ -376,18 +383,19 @@ pub(crate) async fn create_order_in_tx(
     .await?;
 
     let currency = currency.unwrap_or_else(|| "KRW".to_string());
+    let pickup_code = new_pickup_code();
     let order_number = format!(
-        "NV-{}-{}",
+        "NV-{}-{}-{pickup_code}",
         Utc::now().format("%Y%m%d"),
-        Uuid::new_v4().simple().to_string()[..8].to_uppercase()
+        Uuid::new_v4().simple()
     );
 
     let order = sqlx::query_as::<_, Order>(
         r#"
         INSERT INTO neurovector.orders
             (order_number, customer_name, customer_phone, status, total_amount, currency,
-             delivery_address, delivery_detail, latitude, longitude, notes, delivery_id)
-        VALUES ($1, $2, $3, 'pending_payment', $4, $5, $6, $7, $8, $9, $10, $11)
+             delivery_address, delivery_detail, latitude, longitude, notes, delivery_id, pickup_code)
+        VALUES ($1, $2, $3, 'pending_payment', $4, $5, $6, $7, $8, $9, $10, $11, $12)
         RETURNING id, order_number, customer_name, customer_phone, status, total_amount,
                   currency, delivery_address, delivery_detail, latitude, longitude,
                   notes, delivery_id, stock_restored_at, created_at, updated_at
@@ -404,6 +412,7 @@ pub(crate) async fn create_order_in_tx(
     .bind(body.longitude)
     .bind(body.notes.as_deref())
     .bind(body.delivery_id)
+    .bind(&pickup_code)
     .fetch_one(&mut **tx)
     .await?;
 
@@ -439,6 +448,7 @@ pub(crate) async fn create_order_in_tx(
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(OrderDetail {
+        pickup_code,
         order,
         items,
         payment: None,
@@ -458,12 +468,20 @@ pub(crate) async fn create_order_in_tx(
 )]
 pub(crate) async fn create_order(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateOrder>,
 ) -> Result<(StatusCode, Json<OrderDetail>), AppError> {
     validate_create_order(&body)?;
-
+    let customer = crate::customer_auth::current(&state, &headers).await?;
     let mut tx = state.pool.begin().await?;
     let detail = create_order_in_tx(&mut tx, &body).await?;
+    if let Some(customer) = customer {
+        sqlx::query("UPDATE neurovector.orders SET customer_user_id=$2 WHERE id=$1")
+            .bind(detail.order.id)
+            .bind(customer.id)
+            .execute(&mut *tx)
+            .await?;
+    }
     order_queue::record_order_event(
         &mut tx,
         "order.created",
@@ -498,8 +516,17 @@ pub(crate) async fn create_order(
 )]
 pub(crate) async fn enqueue_order(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<CreateOrder>,
 ) -> Result<(StatusCode, Json<order_queue::EnqueueOrderResponse>), AppError> {
+    if crate::customer_auth::current(&state, &headers)
+        .await?
+        .is_some()
+    {
+        return Err(AppError::BadRequest(
+            "회원 주문은 /api/v1/orders를 이용해 주세요.".into(),
+        ));
+    }
     let response = order_queue::enqueue_create_order(&state, body).await?;
     Ok((StatusCode::ACCEPTED, Json(response)))
 }
@@ -1027,5 +1054,21 @@ mod tests {
         order.latitude = Some(37.5);
         order.longitude = None;
         assert!(validate_create_order(&order).is_err());
+    }
+}
+
+fn new_pickup_code() -> String {
+    format!("{:04}", Uuid::new_v4().as_u128() % 10000)
+}
+
+#[cfg(test)]
+mod pickup_tests {
+    #[test]
+    fn pickup_codes_are_exactly_four_numeric_digits() {
+        for _ in 0..100 {
+            let code = super::new_pickup_code();
+            assert_eq!(code.len(), 4);
+            assert!(code.bytes().all(|b| b.is_ascii_digit()));
+        }
     }
 }

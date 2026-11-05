@@ -267,7 +267,7 @@ psql "$DATABASE_URL" -f migrations/0007_mission_plans.sql
 | `ADMIN_USERNAME` / `ADMIN_PASSWORD` | `admin` / `neurovector-admin` |
 | `ADMIN_SESSION_TTL_SECONDS` | `86400` |
 | `ADMIN_COOKIE_SECURE` | `false` |
-| `CORS_ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173,...` |
+| `CORS_ALLOWED_ORIGINS` | `http://localhost:5173,http://127.0.0.1:5173,...` (쉼표로 구분, `*`이면 모든 Origin 허용) |
 | `MQTT_HOST` / `MQTT_PORT` | `localhost` / `1883` |
 | `MEDIA_API_BASE_URL` | `http://localhost:9997` |
 | `MEDIA_WHEP_BASE_URL` | `http://localhost:8889` |

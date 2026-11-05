@@ -24,7 +24,7 @@ pub fn router() -> Router<AppState> {
         .route("/recordings/{drone_id}/{filename}", get(download_recording))
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, utoipa::ToSchema)]
 pub struct StreamInfo {
     pub drone_id: String,
     pub publish_url: String,
@@ -40,7 +40,8 @@ pub struct RecordingQuery {
     pub drone_id: Option<String>,
 }
 
-async fn list_streams(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+#[utoipa::path(get,path="/api/v1/streams",tag="streams",responses((status=200,description="MediaMTX 스트림 목록",body=serde_json::Value),(status=503,description="미디어 서버 연결 실패")))]
+pub(crate) async fn list_streams(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
     let paths = state
         .media
         .list_paths()
@@ -49,7 +50,8 @@ async fn list_streams(State(state): State<AppState>) -> Result<Json<Value>, AppE
     Ok(Json(paths))
 }
 
-async fn stream_info(
+#[utoipa::path(get,path="/api/v1/streams/{drone_id}",tag="streams",params(("drone_id"=String,Path,example="school-drone-001")),responses((status=200,description="SRT 송출·수신 주소와 WebRTC WHEP 경로",body=StreamInfo),(status=400,description="잘못된 드론 ID")))]
+pub(crate) async fn stream_info(
     State(state): State<AppState>,
     Path(drone_id): Path<String>,
 ) -> Result<Json<StreamInfo>, AppError> {
@@ -73,7 +75,8 @@ async fn stream_info(
     }))
 }
 
-async fn whep_offer(
+#[utoipa::path(post,path="/api/v1/streams/{drone_id}/whep",tag="streams",params(("drone_id"=String,Path,example="school-drone-001")),request_body(content=String,content_type="application/sdp",description="RTCPeerConnection.createOffer()로 만든 실제 SDP offer"),responses((status=201,description="SDP answer와 세션 Location",body=String,content_type="application/sdp",headers(("Location"=String,description="DELETE할 백엔드 WHEP 세션 경로"))),(status=400,description="잘못된 SDP offer"),(status=404,description="송출 중인 스트림 없음"),(status=503,description="미디어 서버 연결 실패")),description="브라우저는 프론트엔드 /webrtc-config.json의 ICE/TURN 설정으로 RTCPeerConnection을 만든 뒤 ICE 수집을 마치고 offer를 전송합니다. 응답 SDP를 setRemoteDescription에 적용하고, 종료 시 Location 경로로 DELETE합니다. Swagger에서 단순 GET으로 영상을 재생하는 API가 아닙니다.")]
+pub(crate) async fn whep_offer(
     State(state): State<AppState>,
     Path(drone_id): Path<String>,
     body: Bytes,
@@ -100,7 +103,21 @@ async fn whep_offer(
         );
     }
     if let Some(location) = upstream_headers.get(header::LOCATION) {
-        headers.insert(header::LOCATION, location.clone());
+        let session = location
+            .to_str()
+            .map_err(anyhow::Error::from)?
+            .split('?')
+            .next()
+            .and_then(|path| path.trim_end_matches('/').rsplit('/').next())
+            .and_then(|value| Uuid::parse_str(value).ok())
+            .ok_or_else(|| {
+                AppError::ServiceUnavailable("미디어 서버의 세션 경로가 올바르지 않습니다.".into())
+            })?;
+        let path = format!("/api/v1/streams/{drone_id}/whep/{session}");
+        headers.insert(
+            header::LOCATION,
+            HeaderValue::from_str(&path).map_err(anyhow::Error::from)?,
+        );
     }
     headers.insert(
         header::ACCESS_CONTROL_EXPOSE_HEADERS,
@@ -111,7 +128,8 @@ async fn whep_offer(
     Ok((status, headers, answer).into_response())
 }
 
-async fn whep_delete(
+#[utoipa::path(delete,path="/api/v1/streams/{drone_id}/whep/{session_id}",tag="streams",params(("drone_id"=String,Path,example="school-drone-001"),("session_id"=Uuid,Path,description="WHEP 응답 Location의 세션 ID")),responses((status=200,description="미디어 서버가 세션 종료를 확인"),(status=204,description="세션 종료"),(status=404,description="세션 없음")))]
+pub(crate) async fn whep_delete(
     State(state): State<AppState>,
     Path((drone_id, session_id)): Path<(String, Uuid)>,
 ) -> Result<StatusCode, AppError> {
@@ -123,7 +141,8 @@ async fn whep_delete(
     Ok(StatusCode::from_u16(status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY))
 }
 
-async fn list_recordings(
+#[utoipa::path(get,path="/api/v1/recordings",tag="streams",params(("drone_id"=Option<String>,Query,description="생략하면 전체 기체 녹화 목록")),responses((status=200,description="녹화 목록",body=Vec<crate::media::Recording>)))]
+pub(crate) async fn list_recordings(
     State(state): State<AppState>,
     Query(query): Query<RecordingQuery>,
 ) -> Result<Json<Vec<Recording>>, AppError> {
@@ -143,7 +162,8 @@ async fn list_recordings(
     Ok(Json(recordings))
 }
 
-async fn download_recording(
+#[utoipa::path(get,path="/api/v1/recordings/{drone_id}/{filename}",tag="streams",params(("drone_id"=String,Path),("filename"=String,Path)),responses((status=200,description="녹화 파일 다운로드",body=Vec<u8>,content_type="application/octet-stream"),(status=404,description="녹화 파일 없음")))]
+pub(crate) async fn download_recording(
     State(state): State<AppState>,
     Path((drone_id, filename)): Path<(String, String)>,
 ) -> Result<impl IntoResponse, AppError> {

@@ -62,7 +62,11 @@ impl IntoResponse for AppError {
 
         let body = ErrorBody {
             error: code,
-            message: self.to_string(),
+            message: if status.is_server_error() {
+                "서버 오류가 발생했습니다.".into()
+            } else {
+                self.to_string()
+            },
         };
 
         (status, Json(body)).into_response()

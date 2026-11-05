@@ -23,10 +23,13 @@ impl utoipa::Modify for SecurityAddon {
     info(
         title = "NeuroVector API",
         version = env!("CARGO_PKG_VERSION"),
-        description = "드론 배송, 비전 감지, 주문/재고/결제, 관리자 세션 로그인/큐 API"
+        description = "드론 배송, 비전 감지, 주문/재고/결제, 관리자 세션 로그인/큐, 리뷰, SRT/WebRTC WHEP, 학교 시뮬레이션 API"
     ),
     tags(
         (name = "orders", description = "주문 생성, 결제, Kafka 비동기 주문"),
+        (name = "reviews", description = "결제 주문 리뷰·태그·사진 저장과 조회"),
+        (name = "streams", description = "SRT 송출 정보, WebRTC WHEP 세션, 녹화"),
+        (name = "simulation", description = "학교 시뮬레이션 주문 피드"),
         (name = "inventory", description = "상품 재고"),
         (name = "admin", description = "관리자 로그인, 주문 관리, Kafka 큐, Redis 캐시 통계"),
         (name = "system", description = "상태 확인"),
@@ -34,6 +37,24 @@ impl utoipa::Modify for SecurityAddon {
     ),
     modifiers(&SecurityAddon),
     paths(
+        crate::customer_auth::register,
+        crate::customer_auth::login,
+        crate::customer_auth::me,
+        crate::customer_auth::logout,
+        crate::customer_auth::orders,
+        crate::customer_auth::order,
+        crate::customer_auth::reviews,
+        crate::routes::reviews::create_review,
+        crate::routes::reviews::get_review,
+        crate::routes::reviews::list_reviews,
+        crate::routes::reviews::photo,
+        crate::routes::streams::list_streams,
+        crate::routes::streams::stream_info,
+        crate::routes::streams::whep_offer,
+        crate::routes::streams::whep_delete,
+        crate::routes::streams::list_recordings,
+        crate::routes::streams::download_recording,
+        crate::routes::simulation::orders,
         crate::mission::create_plan,
         crate::mission::get_plan,
         crate::mission::cross_check,
@@ -68,6 +89,12 @@ impl utoipa::Modify for SecurityAddon {
         crate::routes::admin::admin_cache_stats
     ),
     components(schemas(
+        crate::routes::reviews::CreateReview,
+        crate::routes::reviews::Review,
+        crate::routes::reviews::ReviewList,
+        crate::routes::streams::StreamInfo,
+        crate::media::Recording,
+        crate::routes::simulation::DispatchOrder,
         crate::mission::PlanInput,
         crate::mission::MissionPlan,
         crate::mission::CrossCheck,
@@ -105,6 +132,46 @@ pub struct ApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openapi_contains_reviews_and_webrtc_contracts() {
+        let value = serde_json::to_value(ApiDoc::openapi()).expect("OpenAPI serializes");
+        for path in [
+            "/api/v1/orders/{id}/review",
+            "/api/v1/reviews",
+            "/api/v1/reviews/{id}/photo",
+            "/api/v1/streams",
+            "/api/v1/streams/{drone_id}/whep",
+            "/api/v1/streams/{drone_id}/whep/{session_id}",
+            "/api/v1/recordings",
+            "/api/v1/simulation/orders",
+        ] {
+            assert!(value["paths"].get(path).is_some(), "missing {path}");
+        }
+        let offer = &value["paths"]["/api/v1/streams/{drone_id}/whep"]["post"];
+        assert!(
+            offer["requestBody"]["content"]
+                .get("application/sdp")
+                .is_some()
+        );
+        assert!(
+            offer["responses"]["201"]["headers"]
+                .get("Location")
+                .is_some()
+        );
+        assert!(value["components"]["schemas"].get("CreateReview").is_some());
+        let photo_content = value["paths"]["/api/v1/reviews/{id}/photo"]["get"]["responses"]["200"]
+            ["content"]
+            .as_object()
+            .expect("photo response has content types");
+        assert_eq!(photo_content.len(), 3);
+        for mime in ["image/jpeg", "image/png", "image/webp"] {
+            assert!(
+                photo_content.contains_key(mime),
+                "missing photo type {mime}"
+            );
+        }
+    }
 
     #[test]
     fn openapi_contains_order_queue_and_admin_paths() {

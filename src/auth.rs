@@ -298,7 +298,7 @@ async fn create_session(
 // inside the blocking task so request cancellation cannot start unbounded work.
 static PASSWORD_WORKERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
-async fn hash_password_async(password: String) -> anyhow::Result<String> {
+pub(crate) async fn hash_password_async(password: String) -> anyhow::Result<String> {
     let permit = PASSWORD_WORKERS.acquire().await?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -307,7 +307,7 @@ async fn hash_password_async(password: String) -> anyhow::Result<String> {
     .await?
 }
 
-async fn verify_password_async(password: String, hash: String) -> anyhow::Result<bool> {
+pub(crate) async fn verify_password_async(password: String, hash: String) -> anyhow::Result<bool> {
     let permit = PASSWORD_WORKERS.acquire().await?;
     Ok(tokio::task::spawn_blocking(move || {
         let _permit = permit;
@@ -334,11 +334,11 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .is_ok()
 }
 
-fn hash_token(token: &str) -> String {
+pub(crate) fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     let raw = headers.get(header::COOKIE)?.to_str().ok()?;
     raw.split(';').find_map(|part| {
         let (key, value) = part.trim().split_once('=')?;
