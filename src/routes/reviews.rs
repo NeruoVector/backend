@@ -19,7 +19,6 @@ const MAX_PHOTO_BYTES: usize = 1024 * 1024;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/orders/{id}/review", get(get_review).post(create_review))
-        .route("/reviews", get(list_reviews))
         .route("/reviews/{id}/photo", get(photo))
 }
 
@@ -148,8 +147,8 @@ pub(crate) async fn get_review(
 
 #[derive(Deserialize)]
 pub struct ListParams {
-    phone: Option<String>,
-    limit: Option<i64>,
+    pub(super) phone: Option<String>,
+    pub(super) limit: Option<i64>,
 }
 #[derive(Serialize, utoipa::ToSchema)]
 pub struct ReviewList {

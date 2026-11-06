@@ -131,6 +131,12 @@ curl -X POST http://localhost:8081/api/v1/orders/{id}/payments \
   -d '{"method":"dummy_card","simulate":"failure"}'
 ```
 
+### 사용자 세션 / 학교 코드 / 리뷰 / 알림
+
+[사용자 기능 API](docs/customer-apis.md)에 경로, 요청 예시, 인증, 마이그레이션 및 검증 방법을 정리했습니다.
+사용자 세션·학교 코드 조회·상품 리뷰·서비스 내 알림은 DB와 연동되어 동작합니다.
+휴대폰 인증과 결제수단 저장은 요청/응답 형식만 정의하고 HTTP 501을 반환합니다.
+
 ### 관리자 세션 로그인
 
 관리자 콘솔과 관리자 API 는 세션 쿠키 기반 로그인을 사용합니다. 최초 기동 시
@@ -245,6 +251,14 @@ psql "$DATABASE_URL" -f migrations/0004_admin_auth.sql
 psql "$DATABASE_URL" -f migrations/0005_detection_distance.sql
 psql "$DATABASE_URL" -f migrations/0006_detection_priority.sql
 psql "$DATABASE_URL" -f migrations/0007_mission_plans.sql
+psql "$DATABASE_URL" -f migrations/0008_order_event_outbox.sql
+psql "$DATABASE_URL" -f migrations/0009_order_reviews.sql
+psql "$DATABASE_URL" -f migrations/0010_customer_auth.sql
+psql "$DATABASE_URL" -f migrations/0011_randomize_legacy_pickup_codes.sql
+psql "$DATABASE_URL" -f migrations/0012_customer_card_metadata.sql
+psql "$DATABASE_URL" -f migrations/0013_order_receipts.sql
+psql "$DATABASE_URL" -f migrations/0014_customer_oauth.sql
+psql "$DATABASE_URL" -f migrations/0015_customer_apis.sql
 ```
 
 `platform` compose 에서는 `migrate` 서비스가 모든 마이그레이션을 순서대로 적용합니다.
