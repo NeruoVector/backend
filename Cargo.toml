@@ -6,6 +6,7 @@ description = "NeuroVector API server (Rust, axum)"
 license = "MIT"
 
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1.0"
 argon2 = "0.5"
 axum = "0.8"

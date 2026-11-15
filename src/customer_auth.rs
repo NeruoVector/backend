@@ -40,6 +40,7 @@ pub(crate) struct Login {
 
 pub fn router() -> Router<AppState> {
     Router::new()
+        .merge(crate::cards::router())
         .route("/auth/register", post(register))
         .route("/auth/login", post(login))
         .route("/auth/me", get(me))
@@ -79,7 +80,7 @@ async fn session(state: &AppState, user: Uuid) -> Result<HeaderMap, AppError> {
     tx.commit().await?;
     Ok(headers)
 }
-async fn session_in_tx(
+pub(crate) async fn session_in_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     user: Uuid,
     secure: bool,
@@ -375,7 +376,9 @@ mod database_tests {
             .replace("neurovector.", "pg_temp.");
         // Trusted embedded migration; only a constant test-schema name is substituted.
         sqlx::raw_sql(sqlx::AssertSqlSafe(migration.as_str()))
-            .execute(&mut *tx).await.unwrap();
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         let first: Vec<(Uuid, String)> =
             sqlx::query_as("SELECT id,pickup_code FROM pg_temp.orders ORDER BY id")
                 .fetch_all(&mut *tx)
@@ -396,7 +399,9 @@ mod database_tests {
         .unwrap();
         assert_eq!(modern, "9876");
         sqlx::raw_sql(sqlx::AssertSqlSafe(migration.as_str()))
-            .execute(&mut *tx).await.unwrap();
+            .execute(&mut *tx)
+            .await
+            .unwrap();
         let repeated: Vec<(Uuid, String)> =
             sqlx::query_as("SELECT id,pickup_code FROM pg_temp.orders ORDER BY id")
                 .fetch_all(&mut *tx)

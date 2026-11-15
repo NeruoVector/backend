@@ -4,6 +4,8 @@ use anyhow::Context;
 
 #[derive(Debug, Clone)]
 pub struct Config {
+    pub oauth: crate::oauth::config::Settings,
+    pub card_metadata_key: Option<crate::card_crypto::CardMetadataKey>,
     pub listen_addr: String,
     pub public_base_url: String,
     pub database_url: String,
@@ -137,7 +139,15 @@ impl Config {
             "DATABASE_MAX_CONNECTIONS must be positive"
         );
 
+        let card_metadata_key = env::var("CARD_METADATA_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())
+            .map(|value| crate::card_crypto::CardMetadataKey::parse(&value))
+            .transpose()?;
+
         Ok(Self {
+            oauth: crate::oauth::config::Settings::from_env()?,
+            card_metadata_key,
             listen_addr,
             public_base_url,
             database_url,

@@ -8,6 +8,8 @@ pub mod detections;
 pub mod flights;
 pub mod inventory;
 pub mod orders;
+pub mod product_photos;
+pub mod receipts;
 pub mod reviews;
 pub mod risk;
 pub mod route_plans;
@@ -24,10 +26,13 @@ pub fn router(state: AppState) -> Router<AppState> {
         .nest("/inventory", inventory::router(state.clone()))
         .nest("/admin", admin::router(state.clone()))
         .merge(reviews::router())
+        .merge(receipts::router())
+        .merge(product_photos::router(state.clone()))
         .merge(simulation::router())
         .merge(streams::router())
         .merge(orders::router())
         .merge(crate::customer_auth::router())
+        .merge(crate::oauth::router())
         .layer(axum::middleware::from_fn_with_state(
             state,
             crate::customer_auth::protect,

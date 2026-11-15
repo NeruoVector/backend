@@ -37,6 +37,9 @@ impl utoipa::Modify for SecurityAddon {
     ),
     modifiers(&SecurityAddon),
     paths(
+        crate::cards::list,
+        crate::cards::create,
+        crate::cards::remove,
         crate::customer_auth::register,
         crate::customer_auth::login,
         crate::customer_auth::me,
@@ -55,6 +58,7 @@ impl utoipa::Modify for SecurityAddon {
         crate::routes::streams::list_recordings,
         crate::routes::streams::download_recording,
         crate::routes::simulation::orders,
+        crate::routes::receipts::receive,
         crate::mission::create_plan,
         crate::mission::get_plan,
         crate::mission::cross_check,
@@ -89,6 +93,10 @@ impl utoipa::Modify for SecurityAddon {
         crate::routes::admin::admin_cache_stats
     ),
     components(schemas(
+        crate::cards::DemoKind,
+        crate::cards::CardInput,
+        crate::cards::Card,
+        crate::cards::CardList,
         crate::routes::reviews::CreateReview,
         crate::routes::reviews::Review,
         crate::routes::reviews::ReviewList,

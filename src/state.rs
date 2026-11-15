@@ -4,6 +4,8 @@ use crate::{cache::Cache, events::KafkaPublisher, media::MediaClient};
 
 #[derive(Clone)]
 pub struct AppState {
+    pub oauth: crate::oauth::config::Settings,
+    pub card_metadata_key: Option<crate::card_crypto::CardMetadataKey>,
     pub pool: PgPool,
     pub redis: crate::redis_store::RedisStore,
     pub cache: Cache,
@@ -30,6 +32,8 @@ pub(crate) fn test_state(pool: PgPool) -> AppState {
         std::time::Duration::from_millis(500),
     );
     AppState {
+        oauth: crate::oauth::config::Settings::disabled(),
+        card_metadata_key: None,
         pool,
         redis: redis.clone(),
         cache: Cache::new(redis, false, 30),

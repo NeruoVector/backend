@@ -16,6 +16,8 @@ use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitEx
 
 mod auth;
 mod cache;
+mod card_crypto;
+mod cards;
 mod config;
 mod customer_auth;
 mod db;
@@ -28,6 +30,7 @@ mod media;
 mod mission;
 mod models;
 mod mqtt;
+mod oauth;
 mod order_queue;
 mod redis_store;
 mod routes;
@@ -72,6 +75,8 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = AppState {
+        oauth: config.oauth.clone(),
+        card_metadata_key: config.card_metadata_key.clone(),
         pool,
         redis: redis.clone(),
         cache: cache::Cache::new(redis, config.cache_enabled, config.cache_ttl_seconds),
@@ -138,7 +143,11 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", docs::ApiDoc::openapi()))
         .nest("/api/v1", routes::router(state.clone()))
         .layer(cors)
-        .layer(TraceLayer::new_for_http())
+        .layer(TraceLayer::new_for_http().make_span_with(
+            |request: &axum::http::Request<axum::body::Body>| {
+                tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
+            },
+        ))
         .with_state(state);
 
     let addr: SocketAddr = config.listen_addr.parse()?;
